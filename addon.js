@@ -1127,11 +1127,39 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
 
       // This must run before the site's player scripts read localStorage.
       await page.evaluateOnNewDocument(() => {
-        try {
-          localStorage.setItem("kvsplayer_selected_format", "1080p");
-          localStorage.setItem("volume", "1");
-        } catch {}
-      });
+  try {
+    localStorage.setItem("kvsplayer_selected_format", "1080p");
+    localStorage.setItem("volume", "1");
+  } catch {}
+
+  const pokePlayer = () => {
+    try {
+      localStorage.setItem("kvsplayer_selected_format", "1080p");
+
+      const player = document.querySelector("#kt_player");
+      if (player) {
+        player.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        player.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        player.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        player.click();
+      }
+
+      const video = document.querySelector("video");
+      if (video) {
+        video.muted = true;
+        video.volume = 0;
+        video.play().catch(() => null);
+      }
+    } catch {}
+  };
+
+  window.addEventListener("DOMContentLoaded", () => {
+    pokePlayer();
+    setTimeout(pokePlayer, 250);
+    setTimeout(pokePlayer, 750);
+    setTimeout(pokePlayer, 1500);
+  });
+});
 
       const found = {
   remoteControlUrl: null,
@@ -1287,141 +1315,156 @@ const considerUrl = (rawUrl, source) => {
       };
 
       const runFlow = async () => {
-        const targetUrl = pageUrl;
+  const runPlayerAttempt = async (targetUrl, referer, label) => {
+    console.log(`[browser-1080p] opening ${label}: ${targetUrl}`);
 
-        console.log(`[browser-1080p] opening lightweight full page ${targetUrl}`);
+    if (!hasBudget(`goto ${label}`, 3000)) return;
 
-        if (!hasBudget("goto", 3000)) return;
+    await page.goto(targetUrl, {
+      referer,
+      waitUntil: "domcontentloaded",
+      timeout: remaining(10000),
+    }).catch(e => {
+      console.log(`[browser-1080p] goto ${label} warning: ${e.message}`);
+    });
 
-        await page.goto(targetUrl, {
-          referer: BASE_URL + "/",
-          waitUntil: "domcontentloaded",
-          timeout: remaining(12000),
-        }).catch(e => {
-          console.log(`[browser-1080p] goto warning: ${e.message}`);
-        });
+    // Avoid old resource entries from a previous attempt on the same page.
+    await page.evaluate(() => {
+      try { performance.clearResourceTimings(); } catch {}
+    }).catch(() => {});
 
-        if (isFound()) return;
-        if (!hasBudget("localStorage force", 1000)) return;
+    if (isFound()) return;
+    if (!hasBudget(`localStorage force ${label}`, 1000)) return;
 
-        const selectedFormat = await page.evaluate(() => {
-          try {
-            localStorage.setItem("kvsplayer_selected_format", "1080p");
-            localStorage.setItem("volume", "1");
-            return localStorage.getItem("kvsplayer_selected_format");
-          } catch (e) {
-            return `ERROR:${e.message}`;
-          }
-        }).catch(e => `ERROR:${e.message}`);
+    const selectedFormat = await page.evaluate(() => {
+      try {
+        localStorage.setItem("kvsplayer_selected_format", "1080p");
+        localStorage.setItem("volume", "1");
+        return localStorage.getItem("kvsplayer_selected_format");
+      } catch (e) {
+        return `ERROR:${e.message}`;
+      }
+    }).catch(e => `ERROR:${e.message}`);
 
-        console.log(`[browser-1080p] localStorage selected_format=${selectedFormat || "(none)"}`);
+    console.log(`[browser-1080p] ${label} localStorage selected_format=${selectedFormat || "(none)"}`);
 
-        await waitOrFound(700);
-        if (isFound()) return;
+    await waitOrFound(500);
+    if (isFound()) return;
 
-        if (!hasBudget("player start", 1200)) return;
+    if (!hasBudget(`player start ${label}`, 1000)) return;
 
-        await page.click("#kt_player").catch(() => {});
-        await page.mouse.click(200, 300).catch(() => {});
+    await page.click("#kt_player").catch(() => {});
+    await page.mouse.click(200, 300).catch(() => {});
 
-        await waitOrFound(1200);
-        if (isFound()) return;
+    await waitOrFound(900);
+    if (isFound()) return;
 
-        if (!hasBudget("quality click", 1500)) return;
+    if (!hasBudget(`quality click ${label}`, 1200)) return;
 
-        const clicked1080p = await page.evaluate(() => {
-          const isVisible = (el) => {
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-          };
+    const clicked1080p = await page.evaluate(() => {
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
+      };
 
-          const clickEl = (el) => {
-            try {
-              el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-              el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              el.click();
-              return true;
-            } catch {
-              return false;
-            }
-          };
-
-          const all = [...document.querySelectorAll("button, a, li, div, span")];
-
-          const direct1080 = all.find(el =>
-            isVisible(el) &&
-            /\b1080p\b/i.test((el.textContent || "").trim())
-          );
-
-          if (direct1080) {
-            return clickEl(direct1080);
-          }
-
-          const menuCandidates = all.filter(el => {
-            const txt = (el.textContent || "").trim();
-            const cls = `${el.className || ""} ${el.id || ""}`;
-            const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
-
-            return isVisible(el) && (
-              /quality|settings|gear|resolution|hd/i.test(txt) ||
-              /quality|settings|gear|resolution|hd/i.test(cls) ||
-              /quality|settings|gear|resolution|hd/i.test(aria)
-            );
-          });
-
-          for (const el of menuCandidates.slice(0, 12)) {
-            clickEl(el);
-          }
-
-          const afterOpen1080 = [...document.querySelectorAll("button, a, li, div, span")]
-            .find(el =>
-              isVisible(el) &&
-              /\b1080p\b/i.test((el.textContent || "").trim())
-            );
-
-          if (afterOpen1080) {
-            return clickEl(afterOpen1080);
-          }
-
+      const clickEl = (el) => {
+        try {
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+          el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+          el.click();
+          return true;
+        } catch {
           return false;
-        }).catch(e => {
-          console.log(`[browser-1080p] quality click error: ${e.message}`);
-          return false;
-        });
-
-        console.log(`[browser-1080p] clicked 1080p option: ${clicked1080p}`);
-
-        await waitOrFound(800);
-        if (isFound()) return;
-
-        if (!hasBudget("playback nudge", 1200)) return;
-
-        await page.evaluate(() => {
-          const video = document.querySelector("video");
-          if (video) {
-            video.muted = true;
-            return video.play().catch(() => null);
-          }
-          return null;
-        }).catch(() => {});
-
-        await page.mouse.click(200, 300).catch(() => {});
-
-        await waitOrFound(6500);
-        if (isFound()) return;
-
-        if (!hasBudget("performance scan", 500)) return;
-
-        const perfUrls = await page.evaluate(() =>
-          performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
-        ).catch(() => []);
-
-        for (const u of perfUrls) {
-          considerUrl(u, "performance");
         }
       };
+
+      const all = [...document.querySelectorAll("button, a, li, div, span")];
+
+      const direct1080 = all.find(el =>
+        isVisible(el) &&
+        /\b1080p\b/i.test((el.textContent || "").trim())
+      );
+
+      if (direct1080) {
+        return clickEl(direct1080);
+      }
+
+      const menuCandidates = all.filter(el => {
+        const txt = (el.textContent || "").trim();
+        const cls = `${el.className || ""} ${el.id || ""}`;
+        const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+
+        return isVisible(el) && (
+          /quality|settings|gear|resolution|hd/i.test(txt) ||
+          /quality|settings|gear|resolution|hd/i.test(cls) ||
+          /quality|settings|gear|resolution|hd/i.test(aria)
+        );
+      });
+
+      for (const el of menuCandidates.slice(0, 12)) {
+        clickEl(el);
+      }
+
+      const afterOpen1080 = [...document.querySelectorAll("button, a, li, div, span")]
+        .find(el =>
+          isVisible(el) &&
+          /\b1080p\b/i.test((el.textContent || "").trim())
+        );
+
+      if (afterOpen1080) {
+        return clickEl(afterOpen1080);
+      }
+
+      return false;
+    }).catch(e => {
+      console.log(`[browser-1080p] ${label} quality click error: ${e.message}`);
+      return false;
+    });
+
+    console.log(`[browser-1080p] ${label} clicked 1080p option: ${clicked1080p}`);
+
+    await waitOrFound(700);
+    if (isFound()) return;
+
+    if (!hasBudget(`playback nudge ${label}`, 1000)) return;
+
+    await page.evaluate(() => {
+      const video = document.querySelector("video");
+      if (video) {
+        video.muted = true;
+        video.volume = 0;
+        return video.play().catch(() => null);
+      }
+      return null;
+    }).catch(() => {});
+
+    await page.mouse.click(200, 300).catch(() => {});
+
+    await waitOrFound(3500);
+    if (isFound()) return;
+
+    if (!hasBudget(`performance scan ${label}`, 500)) return;
+
+    const perfUrls = await page.evaluate(() =>
+      performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
+    ).catch(() => []);
+
+    for (const u of perfUrls) {
+      considerUrl(u, `performance:${label}`);
+    }
+  };
+
+  // First try the lighter embed player.
+  await runPlayerAttempt(`${BASE_URL}/embed/${videoId}`, pageUrl, "embed player");
+
+  // If embed did not expose 1080p, fall back to your original full-page flow.
+  if (!isFound()) {
+    console.log("[browser-1080p] embed did not produce 1080p; falling back to full page");
+    await runPlayerAttempt(pageUrl, BASE_URL + "/", "full page");
+  }
+};
 
       // Do not race runFlow against sleep(timeout).
       // Promise.race does not cancel runFlow, which was causing detached Frame errors
@@ -1837,6 +1880,7 @@ function buildStreamObjects(videoUrls, pageUrl, cookieStr = "") {
     // remote_control.php URLs are self-signed via query params (time/cv/cv2/cv3/cv4)
     // and do not require Referer or Cookie headers for playback — verified in logs.
     // Routing through /proxy only adds a Render relay hop that causes buffering.
+	console.log(`[stream-build] direct stream ${label}: ${decoded.substring(0, 180)}`);
     return {
       name: "PimpBunny 🎥",
       title: label,
