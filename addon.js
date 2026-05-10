@@ -1626,6 +1626,25 @@ if (!has1080pUrl(deduped)) {
 }
 }
 
+// Before launching the browser, try fetching the embed page to get a fresh
+// session-bound 1080p get_file hash — much faster than a full browser session.
+if (browserCanTry1080 && !has1080pUrl(deduped) && videoId) {
+  console.log("[meta] trying embed page for fresh 1080p hash before browser");
+  const embedCookieStr = mergeCookies(cookieStr, deduped.length > 0 ? "" : "");
+  const embedFor1080 = await fetchEmbedCandidates(videoId, pageUrl, cookieStr);
+  const embed1080Candidates = embedFor1080.filter(c => c.quality === "1080p");
+
+  for (const candidate of embed1080Candidates) {
+    const resolved = await resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId);
+    if (resolved) {
+      console.log("[meta] ✅ embed page yielded fresh 1080p get_file");
+      setPlaybackCookiesForUrl(resolved, cookieStr);
+      deduped.unshift(resolved);
+      break;
+    }
+  }
+}
+
 if (browserCanTry1080 && !has1080pUrl(deduped)) {
   console.log("[meta] no 1080p from lightweight/fast resolver; trying tiny browser resolver");
 
