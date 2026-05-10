@@ -1817,9 +1817,16 @@ function buildStreamObjects(videoUrls, pageUrl, cookieStr = "") {
 
     const label = Object.entries(qualityLabels).find(([k]) => decoded.includes(k))?.[1] ?? "HD";
 
+    const isRemoteControl = /\/remote_control\.php\?/i.test(decoded);
+    const isGetFile = /\/get_file\//i.test(decoded);
+
+    // Direct CDN/storage MP4 URLs should go straight to Stremio.
+    // This avoids BOTH your outbound proxy bandwidth and Render bandwidth.
     let streamUrl = u;
 
-    if (PUBLIC_BASE_URL) {
+    // Only signed/controller URLs go through your addon proxy,
+    // because they may need Referer/Cookie headers.
+    if (PUBLIC_BASE_URL && (isRemoteControl || isGetFile)) {
       const playbackCookieStr = getPlaybackCookiesForUrl(u) || cookieStr;
       const token = createStreamToken(u, pageUrl, playbackCookieStr);
       streamUrl = `${PUBLIC_BASE_URL}/proxy?t=${encodeURIComponent(token)}`;
@@ -1946,10 +1953,9 @@ if (tokenMatch) {
   const isSegment = SEGMENT_RE.test(decodedTarget.split("?")[0]);
   const isRemoteControl = /\/remote_control\.php\?/i.test(decodedTarget);
 
-  // Keep this conservative: segments direct, signed remote_control/direct MP4 through the outbound proxy.
-  // If your proxy bandwidth is a problem and remote_control works direct for you, change this to:
-  // const useProxy = !isSegment && !isRemoteControl;
-  const useProxy = !isSegment;
+  // Playback bytes are bandwidth-heavy. Do NOT send them through the outbound proxy.
+// The outbound proxy should only be used for scraping/resolving pages, images, and lightweight checks.
+const useProxy = false;
 
   console.log(`[proxy] target=${decodedTarget} isSegment=${isSegment} isRemoteControl=${isRemoteControl} useProxy=${useProxy}`);
 
