@@ -25,6 +25,8 @@ const BROWSER_IDLE_TTL_MS = Number(process.env.BROWSER_IDLE_TTL_MS || 30 * 1000)
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 3500);
 const ENABLE_BROWSER_EMBED_FIRST = process.env.ENABLE_BROWSER_EMBED_FIRST === "1";
+const ENABLE_META_1080P_PREWARM = process.env.ENABLE_META_1080P_PREWARM !== "0";
+const PREWARM_1080P_TTL_MS = Number(process.env.PREWARM_1080P_TTL_MS || 2 * 60 * 1000);
 
 // Cheap caches to avoid duplicate Stremio/UI requests.
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
@@ -80,6 +82,11 @@ function getStreamToken(token) {
 }
 
 const browser1080pCache = new Map();
+const browser1080pPrewarmCache = new Map();
+
+function browser1080pKey(videoId, pageUrl) {
+  return `${videoId}:${pageUrl}`;
+}
 let sharedBrowser = null;
 let sharedBrowserLaunchPromise = null;
 let browserIdleTimer = null;
@@ -164,6 +171,15 @@ setInterval(() => {
   }
 
   const now = Date.now();
+  
+  for (const [key, val] of browser1080pPrewarmCache.entries()) {
+  if (val.expiresAt <= now) {
+    if (!val.controller.signal.aborted) {
+      val.controller.abort("cleanup expired");
+    }
+    browser1080pPrewarmCache.delete(key);
+  }
+}
 
   for (const [key, val] of catalogCache.entries()) {
     if (val.expiresAt <= now) catalogCache.delete(key);
@@ -226,13 +242,6 @@ function decodeId(id) {
   return cleanSlugPath(String(id || "").replace(/^pb:/, ""));
 }
 
-function makeIdFromPath(pathname) {
-  return `pb:${pathname.replace(/^\/+|\/+$/g, "")}`;
-}
-
-function decodeId(id) {
-  return String(id || "").replace(/^pb:/, "");
-}
 
 function getSetCookiePairs(res) {
   return (res.headers.raw?.()?.["set-cookie"] || [])
@@ -1063,21 +1072,179 @@ function enqueueBrowserJob(fn) {
   return result;
 }
 
-async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
+function getActive1080pPrewarm(pageUrl, videoId) {
+  if (!pageUrl || !videoId) return null;
+
+  const cacheKey = browser1080pKey(videoId, pageUrl);
+  const entry = browser1080pPrewarmCache.get(cacheKey);
+
+  if (!entry) return null;
+
+  if (entry.expiresAt <= Date.now()) {
+    if (!entry.controller.signal.aborted) {
+      entry.controller.abort("prewarm expired");
+    }
+    browser1080pPrewarmCache.delete(cacheKey);
+    return null;
+  }
+
+  return entry;
+}
+
+function abort1080pPrewarm(pageUrl, videoId, reason = "not needed") {
+  const entry = getActive1080pPrewarm(pageUrl, videoId);
+  if (!entry) return;
+
+  console.log(`[prewarm-1080p] aborting ${entry.id || entry.cacheKey}: ${reason}`);
+
+  if (!entry.controller.signal.aborted) {
+    entry.controller.abort(reason);
+  }
+
+  browser1080pPrewarmCache.delete(entry.cacheKey);
+}
+
+async function materializeBrowser1080p(browser1080p, pageUrl, cookieStr) {
+  if (!browser1080p) return null;
+
+  const browserCookieStr = mergeCookies(cookieStr, browser1080p.cookieStr);
+
+  if (browser1080p.remoteControlUrl) {
+    setPlaybackCookiesForUrl(browser1080p.remoteControlUrl, browserCookieStr);
+
+    return {
+      url: browser1080p.remoteControlUrl,
+      cookieStr: browserCookieStr,
+    };
+  }
+
+  if (browser1080p.getFileUrl) {
+    const resolvedBrowserGetFile = await resolveCapturedBrowserGetFile(
+      browser1080p.getFileUrl,
+      pageUrl,
+      browserCookieStr
+    );
+
+    if (resolvedBrowserGetFile) {
+      setPlaybackCookiesForUrl(resolvedBrowserGetFile, browserCookieStr);
+
+      return {
+        url: resolvedBrowserGetFile,
+        cookieStr: browserCookieStr,
+      };
+    }
+  }
+
+  return null;
+}
+
+function start1080pPrewarm({ id, pageUrl, videoId, cookieStr }) {
+  if (!ENABLE_META_1080P_PREWARM) return null;
+  if (!ENABLE_BROWSER_1080P) return null;
+  if (!pageUrl || !videoId) return null;
+
+  const cacheKey = browser1080pKey(videoId, pageUrl);
+
+  if (getCachedBrowser1080p(cacheKey)) {
+    console.log(`[prewarm-1080p] browser cache already has ${cacheKey}`);
+    return null;
+  }
+
+  const existing = getActive1080pPrewarm(pageUrl, videoId);
+  if (existing) {
+    console.log(`[prewarm-1080p] already running for ${id}`);
+    return existing;
+  }
+
+  const controller = new AbortController();
+
+  const entry = {
+    id,
+    cacheKey,
+    pageUrl,
+    videoId,
+    controller,
+    expiresAt: Date.now() + PREWARM_1080P_TTL_MS,
+    promise: null,
+  };
+
+  entry.promise = (async () => {
+    console.log(`[prewarm-1080p] starting for ${id}`);
+
+    const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr, {
+      signal: controller.signal,
+      prewarm: true,
+    });
+
+    if (controller.signal.aborted) {
+      console.log(`[prewarm-1080p] aborted for ${id}`);
+      return null;
+    }
+
+    const materialized = await materializeBrowser1080p(browser1080p, pageUrl, cookieStr);
+
+    if (materialized?.url) {
+      console.log(`[prewarm-1080p] ✅ ready for ${id}: ${materialized.url.substring(0, 100)}`);
+
+      const cachedMeta = metaCache.get(id);
+      if (cachedMeta?.meta) {
+        metaCache.set(id, {
+          ...cachedMeta,
+          videoUrl: materialized.url,
+          videoUrls: [materialized.url],
+          cookieStr: materialized.cookieStr || cachedMeta.cookieStr || cookieStr,
+          updatedAt: Date.now(),
+        });
+      }
+
+      return materialized;
+    }
+
+    console.log(`[prewarm-1080p] no 1080p result for ${id}`);
+    return null;
+  })()
+    .catch(e => {
+      console.log(`[prewarm-1080p] error for ${id}: ${e.message}`);
+      return null;
+    })
+    .finally(() => {
+      setTimeout(() => {
+        if (browser1080pPrewarmCache.get(cacheKey) === entry) {
+          browser1080pPrewarmCache.delete(cacheKey);
+        }
+      }, 30 * 1000).unref?.();
+    });
+
+  browser1080pPrewarmCache.set(cacheKey, entry);
+  return entry;
+}
+
+async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr, options = {}) {
+  const signal = options.signal || null;
   if (!ENABLE_BROWSER_1080P) {
     console.log("[browser-1080p] disabled");
     return null;
   }
 
   if (!pageUrl || !videoId) return null;
+  if (signal?.aborted) {
+  console.log(`[browser-1080p] aborted before start: ${signal.reason || "no reason"}`);
+  return null;
+}
 
-  const cacheKey = `${videoId}:${pageUrl}`;
+  const cacheKey = browser1080pKey(videoId, pageUrl);
   const cached = getCachedBrowser1080p(cacheKey);
   if (cached) return cached;
 
   return enqueueBrowserJob(async () => {
   activeBrowserJobs++;
   cancelSharedBrowserIdleClose();
+  if (signal?.aborted) {
+  console.log(`[browser-1080p] aborted before queued job started: ${signal.reason || "no reason"}`);
+  activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+  scheduleSharedBrowserIdleClose();
+  return null;
+}
 
   const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
   if (cachedInsideQueue) {
@@ -1089,6 +1256,7 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
   let context = null;
 let page = null;
 let getFileGraceTimer = null;
+let onAbort = null;
 
 try {
       // IMPORTANT:
@@ -1200,6 +1368,26 @@ const finishFound = (reason) => {
   }
 };
 
+const abortPromise = signal
+  ? new Promise(resolve => {
+      onAbort = () => {
+        console.log(`[browser-1080p] abort requested: ${signal.reason || "no reason"}`);
+        finishFound("abort");
+
+        if (page) page.close().catch(() => {});
+        if (context) context.close().catch(() => {});
+
+        resolve("abort");
+      };
+
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    })
+  : null;
+
 const scheduleGetFileGraceResolve = () => {
   if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
 
@@ -1303,7 +1491,7 @@ const considerUrl = (rawUrl, source) => {
         return req.continue().catch(() => {});
       });
 
-            const isFound = () => !!found.remoteControlUrl || !!foundDoneReason;
+            const isFound = () => signal?.aborted || !!found.remoteControlUrl || !!foundDoneReason;
 
       const remaining = (maxMs) => {
         const left = deadline - Date.now();
@@ -1321,13 +1509,14 @@ const considerUrl = (rawUrl, source) => {
       };
 
       const waitOrFound = async (ms) => {
-        const waitMs = remaining(ms);
-        if (waitMs <= 0 || isFound()) return;
-        await Promise.race([
-          sleep(waitMs),
-          foundPromise,
-        ]);
-      };
+  const waitMs = remaining(ms);
+  if (waitMs <= 0 || isFound()) return;
+
+  const racers = [sleep(waitMs), foundPromise];
+  if (abortPromise) racers.push(abortPromise);
+
+  await Promise.race(racers);
+};
 
       const runFlow = async () => {
   const runPlayerAttempt = async (targetUrl, referer, label) => {
@@ -1486,6 +1675,10 @@ if (!isFound()) {
       // Promise.race does not cancel runFlow, which was causing detached Frame errors
       // when the page/context closed while quality-click code was still running.
       await runFlow();
+	  if (signal?.aborted || foundDoneReason === "abort") {
+  console.log(`[browser-1080p] stopped by abort signal`);
+  return null;
+}
 
       const getCookiesTarget = typeof context.cookies === "function" ? context : page;
       const cookies = await getCookiesTarget.cookies(BASE_URL).catch(() => []);
@@ -1509,6 +1702,9 @@ if (!isFound()) {
       return null;
     } finally {
   if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
+  if (signal && onAbort) {
+  signal.removeEventListener("abort", onAbort);
+}
   if (page) await page.close().catch(() => {});
   if (context) await context.close().catch(() => {});
 
@@ -1588,7 +1784,8 @@ function has1080pUrl(urls) {
   });
 }
 
-async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
+async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr, options = {}) {
+  const id = options.id || null;
   let candidates = collectAllGetFileCandidates(html, videoId, "raw-html");
 
   candidates.sort((a, b) => {
@@ -1674,15 +1871,20 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
   }
 
   let deduped = dedupeUrls(videoUrls);
+  if (has1080pUrl(deduped)) {
+  abort1080pPrewarm(pageUrl, videoId, "lightweight 1080p resolved");
+}
 
 if (!has1080pUrl(deduped)) {
   const fast1080 = await tryFast1080FromFallback(deduped, pageUrl, cookieStr);
 
   if (fast1080) {
-  console.log("[meta] ✅ fast direct 1080p verified; browser resolver skipped");
-  setPlaybackCookiesForUrl(fast1080, cookieStr);
-  deduped.unshift(fast1080);
-}
+    console.log("[meta] ✅ fast direct 1080p verified; browser resolver skipped");
+    abort1080pPrewarm(pageUrl, videoId, "fast 1080p verified");
+
+    setPlaybackCookiesForUrl(fast1080, cookieStr);
+    deduped.unshift(fast1080);
+  }
 }
 
 // Before launching the browser, try fetching the embed page to get a fresh
@@ -1705,33 +1907,41 @@ if (browserCanTry1080 && !has1080pUrl(deduped) && videoId) {
 }
 
 if (browserCanTry1080 && !has1080pUrl(deduped)) {
-  console.log("[meta] no 1080p from lightweight/fast resolver; trying tiny browser resolver");
+  const prewarmEntry = getActive1080pPrewarm(pageUrl, videoId);
 
-    const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr);
+  if (prewarmEntry) {
+    console.log(`[meta] awaiting existing 1080p prewarm for ${id || videoId}`);
 
-    if (browser1080p?.remoteControlUrl) {
-  const browserCookieStr = mergeCookies(cookieStr, browser1080p.cookieStr);
+    const prewarmed = await prewarmEntry.promise;
 
-  console.log("[meta] ✅ tiny browser produced 1080p remote_control");
-  setPlaybackCookiesForUrl(browser1080p.remoteControlUrl, browserCookieStr);
-  deduped.unshift(browser1080p.remoteControlUrl);
-} else if (browser1080p?.getFileUrl) {
-  const browserCookieStr = mergeCookies(cookieStr, browser1080p.cookieStr);
-
-  const resolvedBrowserGetFile = await resolveCapturedBrowserGetFile(
-    browser1080p.getFileUrl,
-    pageUrl,
-    browserCookieStr
-  );
-
-  if (resolvedBrowserGetFile) {
-    console.log("[meta] ✅ tiny browser get_file resolved to 1080p");
-    setPlaybackCookiesForUrl(resolvedBrowserGetFile, browserCookieStr);
-    deduped.unshift(resolvedBrowserGetFile);
-  } else {
-    console.log("[meta] tiny browser get_file did not resolve");
+    if (prewarmed?.url) {
+      console.log("[meta] ✅ reused prewarmed 1080p");
+      setPlaybackCookiesForUrl(prewarmed.url, prewarmed.cookieStr || cookieStr);
+      deduped.unshift(prewarmed.url);
+    } else {
+      console.log("[meta] prewarm did not produce 1080p");
+    }
   }
 }
+
+if (browserCanTry1080 && !has1080pUrl(deduped)) {
+  console.log("[meta] no 1080p from lightweight/fast/prewarm; trying tiny browser resolver");
+
+  const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr);
+  const materialized = await materializeBrowser1080p(browser1080p, pageUrl, cookieStr);
+
+  if (materialized?.url) {
+    if (/remote_control\.php/i.test(materialized.url)) {
+      console.log("[meta] ✅ tiny browser produced 1080p remote_control");
+    } else {
+      console.log("[meta] ✅ tiny browser get_file resolved to 1080p");
+    }
+
+    setPlaybackCookiesForUrl(materialized.url, materialized.cookieStr || cookieStr);
+    deduped.unshift(materialized.url);
+  } else {
+    console.log("[meta] tiny browser did not produce usable 1080p");
+  }
 }
   const finalDeduped = dedupeUrls(deduped);
 
@@ -1798,27 +2008,40 @@ async function scrapeMetaById(id, options = {}) {
   };
 
   if (!resolveStreams) {
-    console.log(`[meta] metadata-only request; stream resolving skipped`);
-    metaCache.set(id, {
-      meta,
-      videoUrl: null,
-      videoUrls: [],
-      cookieStr,
-      updatedAt: Date.now(),
-    });
-    return { meta, videoUrl: null, videoUrls: [], cookieStr };
-  }
-
-  const videoUrls = await resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr);
-  const videoUrl = videoUrls[0] || null;
+  console.log(`[meta] metadata-only request; stream resolving skipped`);
 
   metaCache.set(id, {
     meta,
-    videoUrl,
-    videoUrls,
+    videoId,
+    pageUrl,
+    videoUrl: null,
+    videoUrls: [],
     cookieStr,
     updatedAt: Date.now(),
   });
+
+  start1080pPrewarm({
+    id,
+    pageUrl,
+    videoId,
+    cookieStr,
+  });
+
+  return { meta, videoUrl: null, videoUrls: [], cookieStr };
+}
+
+  const videoUrls = await resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr, { id });
+  const videoUrl = videoUrls[0] || null;
+
+  metaCache.set(id, {
+  meta,
+  videoId,
+  pageUrl,
+  videoUrl,
+  videoUrls,
+  cookieStr,
+  updatedAt: Date.now(),
+});
 
   return { meta, videoUrl, videoUrls, cookieStr };
 }
@@ -1860,8 +2083,17 @@ builder.defineMetaHandler(async ({ type, id }) => {
   try {
     const cached = metaCache.get(id);
     if (cached && cached.meta && Date.now() - cached.updatedAt < 10 * 60 * 1000) {
-      return { meta: cached.meta };
-    }
+  if (!cached.videoUrls?.length && cached.videoId && cached.pageUrl && cached.cookieStr) {
+    start1080pPrewarm({
+      id,
+      pageUrl: cached.pageUrl,
+      videoId: cached.videoId,
+      cookieStr: cached.cookieStr,
+    });
+  }
+
+  return { meta: cached.meta };
+}
 
     const { meta } = await scrapeMetaById(id, { resolveStreams: false });
     return { meta };
