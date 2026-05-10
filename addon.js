@@ -23,6 +23,10 @@ const BROWSER_1080P_CACHE_MS = Number(process.env.BROWSER_1080P_CACHE_MS || 180 
 const BROWSER_IDLE_TTL_MS = Number(process.env.BROWSER_IDLE_TTL_MS || 30 * 1000);
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 
+// Cheap caches to avoid duplicate Stremio/UI requests.
+const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
+const CATALOG_CACHE_MS = Number(process.env.CATALOG_CACHE_MS || 10 * 60 * 1000);
+
 const browser1080pCache = new Map();
 let sharedBrowser = null;
 let sharedBrowserLaunchPromise = null;
@@ -90,11 +94,18 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 const metaCache = new Map();
+const catalogCache = new Map();
 
 setInterval(() => {
   const cutoff = Date.now() - 60 * 60 * 1000;
+
   for (const [key, val] of metaCache.entries()) {
     if (val.updatedAt < cutoff) metaCache.delete(key);
+  }
+
+  const now = Date.now();
+  for (const [key, val] of catalogCache.entries()) {
+    if (val.expiresAt <= now) catalogCache.delete(key);
   }
 }, 15 * 60 * 1000);
 
@@ -353,26 +364,23 @@ async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
     if (allMetas.length > 0) return allMetas;
   }
 
-  const candidates = [
-    `${BASE_URL}/${page > 1 ? `?paged=${page}` : ""}`,
-    `${BASE_URL}/${page > 1 ? `page/${page}` : ""}`,
-    `${BASE_URL}/videos${page > 1 ? `?paged=${page}` : ""}`,
-    `${BASE_URL}/videos/${page > 1 ? `page/${page}/` : ""}`,
-  ];
+  const catalogUrl = page <= 1
+  ? `${BASE_URL}/videos/`
+  : `${BASE_URL}/videos/${page}/`;
 
-  let lastError = null;
-  for (const url of candidates) {
-    try {
-      const html = await fetchHtml(url);
-      const metas = extractPostCards(html);
-      if (metas.length > 0) return metas;
-    } catch (err) {
-      lastError = err;
-      console.warn(`Catalog candidate failed: ${url} -> ${err.message}`);
-    }
+try {
+  const html = await fetchHtml(catalogUrl);
+  const metas = extractPostCards(html, catalogUrl);
+
+  if (metas.length > 0) {
+    return metas;
   }
 
-  throw lastError || new Error("No catalog pages could be fetched");
+  throw new Error(`No metas found on ${catalogUrl}`);
+} catch (err) {
+  console.warn(`Catalog fetch failed: ${catalogUrl} -> ${err.message}`);
+  throw err;
+}
 }
 
 function extractVideoIdFromHtml(html) {
@@ -589,9 +597,21 @@ async function fetchEmbedCandidates(videoId, pageUrl, cookieStr) {
 
 function addRndParam(url, quality) {
   const base = decodeEscapedMediaString(url);
-  const sep = base.includes("?") ? "&" : "?";
-  const resParam = ADD_RES_PARAM_FOR_1080 && quality === "1080p" ? "&res=1080p" : "";
-  return `${base}${sep}rnd=${Date.now()}${resParam}`;
+
+  try {
+    const u = new URL(base);
+    u.searchParams.set("rnd", String(Date.now()));
+
+    if (ADD_RES_PARAM_FOR_1080 && quality === "1080p") {
+      u.searchParams.set("res", "1080p");
+    }
+
+    return u.toString();
+  } catch {
+    const sep = base.includes("?") ? "&" : "?";
+    const resParam = ADD_RES_PARAM_FOR_1080 && quality === "1080p" ? "&res=1080p" : "";
+    return `${base}${sep}rnd=${Date.now()}${resParam}`;
+  }
 }
 
 async function resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId) {
@@ -936,12 +956,15 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
         }
 
         if (/\/get_file\//i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
-          if (!found.getFileUrl) {
-            found.getFileUrl = rawUrl;
-            console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
-            resolveFound("get_file");
-          }
-        }
+  if (!found.getFileUrl) {
+    found.getFileUrl = rawUrl;
+    console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
+
+    // Do not resolve foundPromise here.
+    // Waiting a little longer lets Chromium see the 302 Location header and capture
+    // the final remote_control.php URL directly, avoiding one extra server resolve request.
+  }
+}
       };
 
       page.on("response", res => {
@@ -1003,7 +1026,7 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
         return req.continue().catch(() => {});
       });
 
-            const isFound = () => !!found.remoteControlUrl || !!found.getFileUrl;
+            const isFound = () => !!found.remoteControlUrl;
 
       const remaining = (maxMs) => {
         const left = deadline - Date.now();
@@ -1254,18 +1277,6 @@ function has1080pUrl(urls) {
 async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
   let candidates = collectAllGetFileCandidates(html, videoId, "raw-html");
 
-  if (ENABLE_EMBED_FALLBACK) {
-    const embedCandidates = await fetchEmbedCandidates(videoId, pageUrl, cookieStr);
-    const seen = new Set(candidates.map(c => `${c.quality}:${c.hash}:${c.url}`));
-    for (const c of embedCandidates) {
-      const key = `${c.quality}:${c.hash}:${c.url}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        candidates.push(c);
-      }
-    }
-  }
-
   candidates.sort((a, b) => {
     const q = qualityRank(a.quality) - qualityRank(b.quality);
     if (q !== 0) return q;
@@ -1280,27 +1291,82 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
     }
   }
 
-  // The localStorage discovery means the real browser chooses 1080p first.
-  // Server-side, this is the equivalent: resolve 1080p first, then fall back.
-  const resolveList = candidates.slice(0, MAX_RESOLVE_CANDIDATES);
-  console.log(`[meta] resolve list: ${resolveList.map(c => `${c.quality}:${getQualSuffix(c.url)}`).join(", ")} (kept ${resolveList.length}/${candidates.length})`);
-
+  const browserCanTry1080 = ENABLE_BROWSER_1080P && !!videoId;
   const videoUrls = [];
-  for (const candidate of resolveList) {
-    const resolved = await resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId);
-    if (resolved) videoUrls.push(resolved);
+
+  const dedupeUrls = (urls) => {
+    const seenPaths = new Set();
+
+    return urls.filter(u => {
+      const path = getFilePathForDedupe(u);
+      if (seenPaths.has(path)) return false;
+      seenPaths.add(path);
+      return true;
+    });
+  };
+
+  const resolveFallbackCandidates = async (sourceCandidates, label) => {
+    const resolveList = browserCanTry1080
+      // Browser is responsible for 1080p. Lightweight path only needs one fallback.
+      ? sourceCandidates.filter(c => c.quality !== "1080p").slice(0, MAX_RESOLVE_CANDIDATES)
+      : sourceCandidates.slice(0, MAX_RESOLVE_CANDIDATES);
+
+    console.log(
+      `[meta] ${label} resolve list: ${
+        resolveList.map(c => `${c.quality}:${getQualSuffix(c.url)}`).join(", ") || "(none)"
+      } (kept ${resolveList.length}/${sourceCandidates.length})`
+    );
+
+    for (const candidate of resolveList) {
+      const resolved = await resolveGetFileCandidate(candidate, pageUrl, cookieStr, videoId);
+
+      if (resolved) {
+        videoUrls.push(resolved);
+
+        // One fallback is enough. Stop before probing stale duplicate 720p/480p URLs.
+        if (browserCanTry1080 && !has1080pUrl([resolved])) {
+          console.log(`[meta] fallback captured; skipping more lightweight probes`);
+          break;
+        }
+      }
+    }
+  };
+
+  // First: use only raw page candidates. In your working logs, this gives the good 720p fallback.
+  await resolveFallbackCandidates(candidates, "raw");
+
+  // Only fetch /embed/<id> if raw fallback failed. This saves one request on the normal working path.
+  if (videoUrls.length === 0 && ENABLE_EMBED_FALLBACK && videoId) {
+    console.log("[embed] raw fallback failed; fetching embed fallback");
+
+    const embedCandidates = await fetchEmbedCandidates(videoId, pageUrl, cookieStr);
+    const seen = new Set(candidates.map(c => `${c.quality}:${c.hash}:${c.url}`));
+
+    const uniqueEmbedCandidates = [];
+    for (const c of embedCandidates) {
+      const key = `${c.quality}:${c.hash}:${c.url}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueEmbedCandidates.push(c);
+      }
+    }
+
+    uniqueEmbedCandidates.sort((a, b) => {
+      const q = qualityRank(a.quality) - qualityRank(b.quality);
+      if (q !== 0) return q;
+      return a.hash.localeCompare(b.hash);
+    });
+
+    await resolveFallbackCandidates(uniqueEmbedCandidates, "embed");
+  } else if (ENABLE_EMBED_FALLBACK) {
+    console.log("[embed] fallback skipped; raw fallback already available");
   }
 
-  const seenPaths = new Set();
-  const deduped = videoUrls.filter(u => {
-    const path = getFilePathForDedupe(u);
-    if (seenPaths.has(path)) return false;
-    seenPaths.add(path);
-    return true;
-  });
+  let deduped = dedupeUrls(videoUrls);
 
-  if (!has1080pUrl(deduped)) {
+  if (browserCanTry1080 && !has1080pUrl(deduped)) {
     console.log("[meta] no 1080p from lightweight resolver; trying tiny browser resolver");
+
     const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr);
 
     if (browser1080p?.remoteControlUrl) {
@@ -1324,15 +1390,13 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
     }
   }
 
-  const finalSeenPaths = new Set();
-  const finalDeduped = deduped.filter(u => {
-    const path = getFilePathForDedupe(u);
-    if (finalSeenPaths.has(path)) return false;
-    finalSeenPaths.add(path);
-    return true;
-  });
+  const finalDeduped = dedupeUrls(deduped);
 
-  console.log(`[meta] resolved ${finalDeduped.length} playable URL(s) (deduped from ${videoUrls.length})`);
+  console.log(
+    `[meta] resolved ${finalDeduped.length} playable URL(s) ` +
+    `(lightweight=${videoUrls.length}, final=${finalDeduped.length})`
+  );
+
   return finalDeduped;
 }
 
@@ -1419,8 +1483,27 @@ async function scrapeMetaById(id, options = {}) {
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
   if (type !== "movie") return { metas: [] };
 
+  const cacheKey = JSON.stringify({
+    id,
+    skip: extra?.skip || 0,
+    search: extra?.search || "",
+    genre: extra?.genre || "",
+  });
+
   try {
+    const cached = catalogCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      console.log(`[catalog] cache hit ${cacheKey}`);
+      return { metas: cached.metas };
+    }
+
     const metas = await fetchCatalogPage(id, extra?.skip || 0, extra?.search || "", extra?.genre || "");
+
+    catalogCache.set(cacheKey, {
+      metas,
+      expiresAt: Date.now() + CATALOG_CACHE_MS,
+    });
+
     return { metas };
   } catch (err) {
     console.error("Catalog error:", err.message);
@@ -1452,12 +1535,51 @@ builder.defineMetaHandler(async ({ type, id }) => {
   }
 });
 
+function buildStreamObjects(videoUrls, pageUrl) {
+  const qualityLabels = {
+    "_1080p": "1080p",
+    "_720p": "720p",
+    "_480p": "480p",
+    "_360p": "360p",
+  };
+
+  return videoUrls.map(u => {
+    let decoded = u;
+    try { decoded = decodeURIComponent(u); } catch {}
+
+    const label = Object.entries(qualityLabels).find(([k]) => decoded.includes(k))?.[1] ?? "HD";
+    const streamUrl = PUBLIC_BASE_URL
+      ? `${PUBLIC_BASE_URL}/proxy?url=${encodeURIComponent(u)}&ref=${encodeURIComponent(pageUrl)}`
+      : u;
+
+    return {
+      name: "PimpBunny 🎥",
+      title: label,
+      url: streamUrl,
+      behaviorHints: { notWebReady: false },
+    };
+  });
+}
+
 builder.defineStreamHandler(async ({ type, id }) => {
   if (type !== "movie") return { streams: [] };
 
   const pageUrl = absoluteUrl(`/${decodeId(id)}/`);
 
   try {
+    const cached = metaCache.get(id);
+
+    if (
+      cached &&
+      cached.videoUrls &&
+      cached.videoUrls.length > 0 &&
+      Date.now() - cached.updatedAt < STREAM_CACHE_MS
+    ) {
+      console.log(`[stream] short cache hit for ${id}`);
+      const streams = buildStreamObjects(cached.videoUrls, pageUrl);
+      return { streams };
+    }
+
     console.log(`[stream] fresh scrape for ${id}`);
     const { videoUrls } = await scrapeMetaById(id, { resolveStreams: true });
 
@@ -1466,29 +1588,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
       return { streams: [{ name: "PimpBunny 🔗", title: "Open Page", externalUrl: pageUrl }] };
     }
 
-    const qualityLabels = {
-      "_1080p": "1080p",
-      "_720p": "720p",
-      "_480p": "480p",
-      "_360p": "360p",
-    };
-
-    const streams = videoUrls.map(u => {
-      let decoded = u;
-      try { decoded = decodeURIComponent(u); } catch {}
-
-      const label = Object.entries(qualityLabels).find(([k]) => decoded.includes(k))?.[1] ?? "HD";
-      const streamUrl = PUBLIC_BASE_URL
-        ? `${PUBLIC_BASE_URL}/proxy?url=${encodeURIComponent(u)}&ref=${encodeURIComponent(pageUrl)}`
-        : u;
-
-      return {
-        name: "PimpBunny 🎥",
-        title: label,
-        url: streamUrl,
-        behaviorHints: { notWebReady: false },
-      };
-    });
+    const streams = buildStreamObjects(videoUrls, pageUrl);
 
     console.log(`[stream] returning ${streams.length} stream(s), first: ${streams[0]?.url?.substring(0, 80)}`);
     return { streams };
