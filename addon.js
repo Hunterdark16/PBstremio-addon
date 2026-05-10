@@ -1817,25 +1817,14 @@ function buildStreamObjects(videoUrls, pageUrl, cookieStr = "") {
 
     const label = Object.entries(qualityLabels).find(([k]) => decoded.includes(k))?.[1] ?? "HD";
 
-    const isRemoteControl = /\/remote_control\.php\?/i.test(decoded);
-    const isGetFile = /\/get_file\//i.test(decoded);
-
-    // Direct CDN/storage MP4 URLs should go straight to Stremio.
-    // This avoids BOTH your outbound proxy bandwidth and Render bandwidth.
-    let streamUrl = u;
-
-    // Only signed/controller URLs go through your addon proxy,
-    // because they may need Referer/Cookie headers.
-    if (PUBLIC_BASE_URL && (isRemoteControl || isGetFile)) {
-      const playbackCookieStr = getPlaybackCookiesForUrl(u) || cookieStr;
-      const token = createStreamToken(u, pageUrl, playbackCookieStr);
-      streamUrl = `${PUBLIC_BASE_URL}/proxy?t=${encodeURIComponent(token)}`;
-    }
-
+    // Always give Stremio the raw URL directly.
+    // remote_control.php URLs are self-signed via query params (time/cv/cv2/cv3/cv4)
+    // and do not require Referer or Cookie headers for playback — verified in logs.
+    // Routing through /proxy only adds a Render relay hop that causes buffering.
     return {
       name: "PimpBunny 🎥",
       title: label,
-      url: streamUrl,
+      url: u,
       behaviorHints: { notWebReady: false },
     };
   });
