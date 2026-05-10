@@ -3,15 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "main": "addon.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node addon.js"
+    "start": "node addon.js",
+    "check": "node --check addon.js"
   },
   "dependencies": {
-    "cheerio": "1.0.0-rc.12",
-    "express": "^4.18.2",
+    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
     "https-proxy-agent": "^7.0.5",
     "node-fetch": "^2.7.0",
-    "puppeteer-core": "^22.15.0",
-    "stremio-addon-sdk": "latest"
+    "puppeteer-core": "^24.0.0",
+    "stremio-addon-sdk": "^1.6.10"
   }
 }
