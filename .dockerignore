@@ -1,11 +1,6 @@
+node_modules
+npm-debug.log
 .git
 .gitignore
-node_modules
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.DS_Store
 .env
-.env.*
-*.zip
-README.local.md
+.DS_Store
