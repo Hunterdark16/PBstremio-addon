@@ -23,13 +23,35 @@ const BROWSER_1080P_TIMEOUT_MS = Number(process.env.BROWSER_1080P_TIMEOUT_MS || 
 const BROWSER_1080P_CACHE_MS = Number(process.env.BROWSER_1080P_CACHE_MS || 180 * 1000);
 const BROWSER_IDLE_TTL_MS = Number(process.env.BROWSER_IDLE_TTL_MS || 30 * 1000);
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
-const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 1200);
+const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 3500);
 
 // Cheap caches to avoid duplicate Stremio/UI requests.
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
 const CATALOG_CACHE_MS = Number(process.env.CATALOG_CACHE_MS || 10 * 60 * 1000);
 const STREAM_TOKEN_TTL_MS = Number(process.env.STREAM_TOKEN_TTL_MS || 10 * 60 * 1000);
 const streamTokenCache = new Map();
+const playbackCookieCache = new Map();
+
+function setPlaybackCookiesForUrl(url, cookieStr = "") {
+  if (!url || !cookieStr) return;
+
+  playbackCookieCache.set(url, {
+    cookieStr,
+    expiresAt: Date.now() + STREAM_TOKEN_TTL_MS,
+  });
+}
+
+function getPlaybackCookiesForUrl(url) {
+  const entry = playbackCookieCache.get(url);
+  if (!entry) return "";
+
+  if (entry.expiresAt <= Date.now()) {
+    playbackCookieCache.delete(url);
+    return "";
+  }
+
+  return entry.cookieStr || "";
+}
 
 function createStreamToken(targetUrl, referer, cookieStr = "") {
   const token = crypto.randomBytes(16).toString("hex");
@@ -141,12 +163,18 @@ setInterval(() => {
   }
 
   const now = Date.now();
+
   for (const [key, val] of catalogCache.entries()) {
     if (val.expiresAt <= now) catalogCache.delete(key);
   }
+
   for (const [key, val] of streamTokenCache.entries()) {
-  if (val.expiresAt <= now) streamTokenCache.delete(key);
-}
+    if (val.expiresAt <= now) streamTokenCache.delete(key);
+  }
+
+  for (const [key, val] of playbackCookieCache.entries()) {
+    if (val.expiresAt <= now) playbackCookieCache.delete(key);
+  }
 }, 15 * 60 * 1000);
 
 const HEADERS = {
@@ -1106,18 +1134,22 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
       });
 
       const found = {
-        remoteControlUrl: null,
-        getFileUrl: null,
-      };
+  remoteControlUrl: null,
+  getFileUrl: null,
+};
 
-      let resolveFound;
-      const foundPromise = new Promise(resolve => {
-        resolveFound = resolve;
-      });
+let foundDoneReason = null;
+let resolveFound;
+
+const foundPromise = new Promise(resolve => {
+  resolveFound = resolve;
+});
 
     
 
 const finishFound = (reason) => {
+  foundDoneReason = reason;
+
   if (resolveFound) {
     const fn = resolveFound;
     resolveFound = null;
@@ -1228,7 +1260,7 @@ const considerUrl = (rawUrl, source) => {
         return req.continue().catch(() => {});
       });
 
-            const isFound = () => !!found.remoteControlUrl || !!found.getFileUrl;
+            const isFound = () => !!found.remoteControlUrl || !!foundDoneReason;
 
       const remaining = (maxMs) => {
         const left = deadline - Date.now();
@@ -1591,9 +1623,10 @@ if (!has1080pUrl(deduped)) {
   const fast1080 = await tryFast1080FromFallback(deduped, pageUrl, cookieStr);
 
   if (fast1080) {
-    console.log("[meta] ✅ fast direct 1080p verified; browser resolver skipped");
-    deduped.unshift(fast1080);
-  }
+  console.log("[meta] ✅ fast direct 1080p verified; browser resolver skipped");
+  setPlaybackCookiesForUrl(fast1080, cookieStr);
+  deduped.unshift(fast1080);
+}
 }
 
 if (browserCanTry1080 && !has1080pUrl(deduped)) {
@@ -1602,25 +1635,28 @@ if (browserCanTry1080 && !has1080pUrl(deduped)) {
     const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr);
 
     if (browser1080p?.remoteControlUrl) {
-      console.log("[meta] ✅ tiny browser produced 1080p remote_control");
-      deduped.unshift(browser1080p.remoteControlUrl);
-    } else if (browser1080p?.getFileUrl) {
-      const resolvedBrowserGetFile = await resolveCapturedBrowserGetFile(
-        browser1080p.getFileUrl,
-        pageUrl,
-        mergeCookies(cookieStr, browser1080p.cookieStr)
-      );
+  const browserCookieStr = mergeCookies(cookieStr, browser1080p.cookieStr);
 
-      if (resolvedBrowserGetFile) {
-        console.log("[meta] ✅ tiny browser get_file resolved to 1080p");
-        deduped.unshift(resolvedBrowserGetFile);
-      } else {
-        console.log("[meta] tiny browser get_file did not resolve");
-      }
-    } else {
-      console.log("[meta] tiny browser resolver found no 1080p URL");
-    }
+  console.log("[meta] ✅ tiny browser produced 1080p remote_control");
+  setPlaybackCookiesForUrl(browser1080p.remoteControlUrl, browserCookieStr);
+  deduped.unshift(browser1080p.remoteControlUrl);
+} else if (browser1080p?.getFileUrl) {
+  const browserCookieStr = mergeCookies(cookieStr, browser1080p.cookieStr);
+
+  const resolvedBrowserGetFile = await resolveCapturedBrowserGetFile(
+    browser1080p.getFileUrl,
+    pageUrl,
+    browserCookieStr
+  );
+
+  if (resolvedBrowserGetFile) {
+    console.log("[meta] ✅ tiny browser get_file resolved to 1080p");
+    setPlaybackCookiesForUrl(resolvedBrowserGetFile, browserCookieStr);
+    deduped.unshift(resolvedBrowserGetFile);
+  } else {
+    console.log("[meta] tiny browser get_file did not resolve");
   }
+}
 
   const finalDeduped = dedupeUrls(deduped);
 
@@ -1784,7 +1820,8 @@ function buildStreamObjects(videoUrls, pageUrl, cookieStr = "") {
     let streamUrl = u;
 
     if (PUBLIC_BASE_URL) {
-      const token = createStreamToken(u, pageUrl, cookieStr);
+      const playbackCookieStr = getPlaybackCookiesForUrl(u) || cookieStr;
+      const token = createStreamToken(u, pageUrl, playbackCookieStr);
       streamUrl = `${PUBLIC_BASE_URL}/proxy?t=${encodeURIComponent(token)}`;
     }
 
@@ -1918,11 +1955,12 @@ if (tokenMatch) {
 
   try {
     const fetchHeaders = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "User-Agent": HEADERS["User-Agent"],
   "Referer": referer,
   "Origin": BASE_URL,
   "Accept": VIDEO_HEADERS.Accept,
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "identity;q=1, *;q=0",
   "Connection": "keep-alive",
   ...(proxyCookieStr ? { Cookie: proxyCookieStr } : {}),
 };
@@ -1936,6 +1974,12 @@ if (tokenMatch) {
       headers: fetchHeaders,
       redirect: "follow",
     }, useProxy);
+	console.log(
+  `[proxy] upstream status=${upstream.status} ` +
+  `type=${upstream.headers.get("content-type") || "(none)"} ` +
+  `len=${upstream.headers.get("content-length") || "(none)"} ` +
+  `range=${upstream.headers.get("content-range") || "(none)"}`
+);
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => "");
