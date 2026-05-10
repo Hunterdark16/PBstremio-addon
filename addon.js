@@ -1061,33 +1061,37 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
   if (cached) return cached;
 
   return enqueueBrowserJob(async () => {
-    activeBrowserJobs++;
-    cancelSharedBrowserIdleClose();
+  activeBrowserJobs++;
+  cancelSharedBrowserIdleClose();
 
-    const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
-    if (cachedInsideQueue) {
-      activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
-      scheduleSharedBrowserIdleClose();
-      return cachedInsideQueue;
-    }
+  const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
+  if (cachedInsideQueue) {
+    activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+    scheduleSharedBrowserIdleClose();
+    return cachedInsideQueue;
+  }
 
-    let context = null;
-    let page = null;
-    let getFileGraceTimer = null;
+  let context = null;
+let page = null;
+let getFileGraceTimer = null;
 
-    try {
+try {
+      // IMPORTANT:
+      // Launch can be slow on Render cold starts. Do not count launch time
+      // against the page/player runtime budget.
       const browser = await getSharedBrowser();
       if (!browser) return null;
 
       const startedAt = Date.now();
-      const deadline = startedAt + BROWSER_1080P_TIMEOUT_MS;
-      const timeLeft = () => Math.max(0, deadline - Date.now());
+const deadline = startedAt + BROWSER_1080P_TIMEOUT_MS;
+const timeLeft = () => Math.max(0, deadline - Date.now());
 
       context = browser.createBrowserContext
         ? await browser.createBrowserContext()
         : await browser.createIncognitoBrowserContext();
 
       page = await context.newPage();
+
       page.setDefaultTimeout(Math.min(8000, timeLeft()));
       page.setDefaultNavigationTimeout(Math.min(8000, timeLeft()));
 
@@ -1096,87 +1100,125 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
       }
 
       await page.setUserAgent(HEADERS["User-Agent"]);
-      await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
-      await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+
+      await page.setViewport({
+        width: 390,
+        height: 844,
+        deviceScaleFactor: 2,
+        isMobile: true,
+        hasTouch: true,
+      });
+
+      await page.setExtraHTTPHeaders({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-GPC": "1",
+      });
 
       const seededCookies = cookiesFromHeader(cookieStr);
       if (seededCookies.length) {
         const setCookieTarget = typeof context.setCookie === "function" ? context : page;
+
         await setCookieTarget.setCookie(...seededCookies).catch(e => {
           console.log(`[browser-1080p] cookie seed error: ${e.message}`);
         });
+
         console.log(`[browser-1080p] seeded ${seededCookies.length} cookie(s)`);
       }
 
-      // Force 1080p before any page scripts run.
+      // This must run before the site's player scripts read localStorage.
       await page.evaluateOnNewDocument(() => {
         try {
           localStorage.setItem("kvsplayer_selected_format", "1080p");
-          localStorage.setItem("volume", "0");
+          localStorage.setItem("volume", "1");
         } catch {}
       });
 
-      const found = { remoteControlUrl: null, getFileUrl: null };
-      let foundDoneReason = null;
-      let resolveFound;
+      const found = {
+  remoteControlUrl: null,
+  getFileUrl: null,
+};
 
-      const foundPromise = new Promise(resolve => { resolveFound = resolve; });
+let foundDoneReason = null;
+let resolveFound;
 
-      const finishFound = (reason) => {
-        if (foundDoneReason) return;
-        foundDoneReason = reason;
-        const fn = resolveFound;
-        resolveFound = null;
-        if (fn) fn(reason);
-      };
+const foundPromise = new Promise(resolve => {
+  resolveFound = resolve;
+});
 
-      const scheduleGetFileGraceResolve = () => {
-        if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
-        getFileGraceTimer = setTimeout(() => {
-          if (found.getFileUrl && !found.remoteControlUrl) {
-            console.log(`[browser-1080p] get_file grace elapsed; resolving captured get_file`);
-            finishFound("get_file");
-          }
-        }, GETFILE_CAPTURE_GRACE_MS);
-        getFileGraceTimer.unref?.();
-      };
+    
 
-      const considerUrl = (rawUrl, source) => {
-        if (!rawUrl) return;
-        let decoded = rawUrl;
-        try { decoded = decodeURIComponent(rawUrl); } catch {}
-        if (!decoded.includes(String(videoId))) return;
+const finishFound = (reason) => {
+  foundDoneReason = reason;
 
-        if (/\/remote_control\.php\?/i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
-          if (!found.remoteControlUrl) {
-            found.remoteControlUrl = rawUrl;
-            console.log(`[browser-1080p] captured 1080p remote_control from ${source}: ${decoded}`);
-            finishFound("remote");
-          }
-          return;
-        }
+  if (resolveFound) {
+    const fn = resolveFound;
+    resolveFound = null;
+    fn(reason);
+  }
+};
 
-        if (/\/get_file\//i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
-          if (!found.getFileUrl) {
-            found.getFileUrl = rawUrl;
-            console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
-            scheduleGetFileGraceResolve();
-          }
-        }
-      };
+const scheduleGetFileGraceResolve = () => {
+  if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
 
-      // Intercept responses for redirect Location headers.
+  getFileGraceTimer = setTimeout(() => {
+    if (found.getFileUrl && !found.remoteControlUrl) {
+      console.log(`[browser-1080p] get_file grace elapsed; resolving captured get_file`);
+      finishFound("get_file");
+    }
+  }, GETFILE_CAPTURE_GRACE_MS);
+
+  getFileGraceTimer.unref?.();
+};
+
+const considerUrl = (rawUrl, source) => {
+  if (!rawUrl) return;
+
+  let decoded = rawUrl;
+  try {
+    decoded = decodeURIComponent(rawUrl);
+  } catch {}
+
+  if (!decoded.includes(String(videoId))) return;
+
+  if (/\/remote_control\.php\?/i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
+    if (!found.remoteControlUrl) {
+      found.remoteControlUrl = rawUrl;
+      console.log(`[browser-1080p] captured 1080p remote_control from ${source}: ${decoded}`);
+      finishFound("remote");
+    }
+    return;
+  }
+
+  if (/\/get_file\//i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
+    if (!found.getFileUrl) {
+      found.getFileUrl = rawUrl;
+      console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
+
+      // Wait briefly for Chromium to expose a 302 Location header.
+      // If it does not, resolve the captured get_file ourselves.
+      scheduleGetFileGraceResolve();
+    }
+  }
+};
+
       page.on("response", res => {
         const responseUrl = res.url();
+
         if (/\/get_file\/|\/remote_control\.php\?/i.test(responseUrl)) {
           let decoded = responseUrl;
-          try { decoded = decodeURIComponent(responseUrl); } catch {}
+          try {
+            decoded = decodeURIComponent(responseUrl);
+          } catch {}
           console.log(`[browser-1080p] saw response: ${decoded}`);
         }
+
         considerUrl(responseUrl, "response");
+
         const location = res.headers()?.location;
         if (location) {
-          try { considerUrl(new URL(location, responseUrl).toString(), "response-location"); } catch {}
+          try {
+            considerUrl(new URL(location, responseUrl).toString(), "response-location");
+          } catch {}
         }
       });
 
@@ -1188,18 +1230,21 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
 
         if (/\/get_file\/|\/remote_control\.php\?/i.test(reqUrl)) {
           let decoded = reqUrl;
-          try { decoded = decodeURIComponent(reqUrl); } catch {}
+          try {
+            decoded = decodeURIComponent(reqUrl);
+          } catch {}
           console.log(`[browser-1080p] saw request ${type}: ${decoded}`);
-          considerUrl(reqUrl, "request");
         }
 
-        // Abort remote_control immediately after capturing — no need to download bytes.
+        considerUrl(reqUrl, "request");
+
+        // Capture signed URL, but do not download video bytes.
         if (/\/remote_control\.php\?/i.test(reqUrl)) {
           return req.abort().catch(() => {});
         }
 
-        // Block everything that isn't needed to get the player to fire its XHR.
-        if (["image", "font", "media", "stylesheet"].includes(type)) {
+        // Save bandwidth/CPU.
+        if (["image", "font"].includes(type)) {
           return req.abort().catch(() => {});
         }
 
@@ -1207,117 +1252,181 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
           return req.abort().catch(() => {});
         }
 
+        // Let player scripts/XHR run. For media, allow only get_file.
+        if (type === "media" && !/\/get_file\//i.test(reqUrl)) {
+          return req.abort().catch(() => {});
+        }
+
         return req.continue().catch(() => {});
       });
 
-      const isFound = () => !!foundDoneReason;
-      const remaining = (maxMs) => Math.min(maxMs, Math.max(0, deadline - Date.now()));
-      const waitOrFound = async (ms) => {
-        if (isFound() || remaining(ms) <= 0) return;
-        await Promise.race([sleep(remaining(ms)), foundPromise]);
+            const isFound = () => !!found.remoteControlUrl || !!foundDoneReason;
+
+      const remaining = (maxMs) => {
+        const left = deadline - Date.now();
+        if (left <= 0) return 0;
+        return Math.min(maxMs, left);
       };
 
-      console.log(`[browser-1080p] opening page ${pageUrl}`);
+      const hasBudget = (label, minMs = 800) => {
+        const left = deadline - Date.now();
+        if (left < minMs) {
+          console.log(`[browser-1080p] budget exhausted before ${label}: ${left}ms left`);
+          return false;
+        }
+        return true;
+      };
 
-     await page.goto(pageUrl, {
+      const waitOrFound = async (ms) => {
+        const waitMs = remaining(ms);
+        if (waitMs <= 0 || isFound()) return;
+        await Promise.race([
+          sleep(waitMs),
+          foundPromise,
+        ]);
+      };
+
+      const runFlow = async () => {
+        const targetUrl = pageUrl;
+
+        console.log(`[browser-1080p] opening lightweight full page ${targetUrl}`);
+
+        if (!hasBudget("goto", 3000)) return;
+
+        await page.goto(targetUrl, {
           referer: BASE_URL + "/",
-          waitUntil: "load",
+          waitUntil: "domcontentloaded",
           timeout: remaining(12000),
-        }).catch(e => console.log(`[browser-1080p] goto warning: ${e.message}`));
+        }).catch(e => {
+          console.log(`[browser-1080p] goto warning: ${e.message}`);
+        });
 
-      if (isFound()) {
-        // Already got it from a request fired during page load — done.
-      } else {
-        // Step 1: Re-confirm localStorage after page scripts have run.
+        if (isFound()) return;
+        if (!hasBudget("localStorage force", 1000)) return;
+
         const selectedFormat = await page.evaluate(() => {
           try {
             localStorage.setItem("kvsplayer_selected_format", "1080p");
+            localStorage.setItem("volume", "1");
             return localStorage.getItem("kvsplayer_selected_format");
-          } catch (e) { return `ERROR:${e.message}`; }
-        }).catch(e => `ERROR:${e.message}`);
-        console.log(`[browser-1080p] localStorage selected_format=${selectedFormat}`);
-
-        // Step 2: Extract the 1080p get_file URL directly from the KVS player config
-        // in the page source — this is the fastest possible path and doesn't require
-        // waiting for the player to fire its XHR.
-        if (!isFound()) {
-          const extractedGetFile = await page.evaluate((vid) => {
-            try {
-              for (const s of document.querySelectorAll("script:not([src])")) {
-                const t = s.textContent || "";
-                if (!t.includes("get_file") || !t.includes(String(vid))) continue;
-
-                // Match both plain URLs and function/N/ wrapped KVS format, with any quoting.
-                const patterns = [
-                  /video_url\s*:\s*['"`]([^'"`]+\/get_file\/[^'"`]+_1080p\.mp4[^'"`]*?)['"`]/i,
-                  /video_alt_url\d*\s*:\s*['"`]([^'"`]+\/get_file\/[^'"`]+_1080p\.mp4[^'"`]*?)['"`]/i,
-                  /((?:function\/\d+\/)?https?:\/\/[^\s'"`\\]+\/get_file\/[^\s'"`\\]+_1080p\.mp4\/?)/i,
-                ];
-
-                for (const re of patterns) {
-                  const m = t.match(re);
-                  if (!m) continue;
-                  let url = m[1];
-                  // Unwrap KVS function/N/ prefix.
-                  url = url.replace(/^function\/\d+\//i, "");
-                  // Decode common JS escape sequences.
-                  url = url.replace(/\\u002f/gi, "/").replace(/\\u0026/gi, "&").replace(/\\\//g, "/");
-                  if (url.startsWith("http") && url.includes(String(vid))) return url;
-                }
-              }
-            } catch {}
-            return null;
-          }, videoId).catch(() => null);
-
-          if (extractedGetFile) {
-            console.log(`[browser-1080p] fast DOM extract: ${extractedGetFile}`);
-            considerUrl(extractedGetFile, "dom-extract");
-          } else {
-            console.log(`[browser-1080p] DOM extract: no 1080p URL found in inline scripts`);
+          } catch (e) {
+            return `ERROR:${e.message}`;
           }
-        }
+        }).catch(e => `ERROR:${e.message}`);
 
-        // Step 3: If DOM extraction gave us a get_file, the grace timer is already running.
-        // Wait briefly for it, or for a network request to confirm.
-        await waitOrFound(1500);
+        console.log(`[browser-1080p] localStorage selected_format=${selectedFormat || "(none)"}`);
 
-        if (!isFound()) {
-          // Step 4: Force the player to request the video by calling its internal API.
-          await page.evaluate(() => {
+        await waitOrFound(700);
+        if (isFound()) return;
+
+        if (!hasBudget("player start", 1200)) return;
+
+        await page.click("#kt_player").catch(() => {});
+        await page.mouse.click(200, 300).catch(() => {});
+
+        await waitOrFound(1200);
+        if (isFound()) return;
+
+        if (!hasBudget("quality click", 1500)) return;
+
+        const clicked1080p = await page.evaluate(() => {
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
+          };
+
+          const clickEl = (el) => {
             try {
-              // Try KVS player global object first.
-              if (window.kvsplayer && typeof window.kvsplayer.setQuality === "function") {
-                window.kvsplayer.setQuality("1080p");
-                return "kvsplayer.setQuality";
-              }
-              // Try clicking the video element to trigger autoplay.
-              const video = document.querySelector("video");
-              if (video) {
-                video.muted = true;
-                video.volume = 0;
-                video.play().catch(() => {});
-                return "video.play";
-              }
-              // Last resort: click the player container.
-              const player = document.querySelector("#kt_player, .kvsplayer, [id*='player']");
-              if (player) { player.click(); return "player.click"; }
-            } catch {}
-            return "none";
-          }).catch(() => {});
+              el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+              el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              el.click();
+              return true;
+            } catch {
+              return false;
+            }
+          };
 
-          await waitOrFound(3000);
+          const all = [...document.querySelectorAll("button, a, li, div, span")];
+
+          const direct1080 = all.find(el =>
+            isVisible(el) &&
+            /\b1080p\b/i.test((el.textContent || "").trim())
+          );
+
+          if (direct1080) {
+            return clickEl(direct1080);
+          }
+
+          const menuCandidates = all.filter(el => {
+            const txt = (el.textContent || "").trim();
+            const cls = `${el.className || ""} ${el.id || ""}`;
+            const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+
+            return isVisible(el) && (
+              /quality|settings|gear|resolution|hd/i.test(txt) ||
+              /quality|settings|gear|resolution|hd/i.test(cls) ||
+              /quality|settings|gear|resolution|hd/i.test(aria)
+            );
+          });
+
+          for (const el of menuCandidates.slice(0, 12)) {
+            clickEl(el);
+          }
+
+          const afterOpen1080 = [...document.querySelectorAll("button, a, li, div, span")]
+            .find(el =>
+              isVisible(el) &&
+              /\b1080p\b/i.test((el.textContent || "").trim())
+            );
+
+          if (afterOpen1080) {
+            return clickEl(afterOpen1080);
+          }
+
+          return false;
+        }).catch(e => {
+          console.log(`[browser-1080p] quality click error: ${e.message}`);
+          return false;
+        });
+
+        console.log(`[browser-1080p] clicked 1080p option: ${clicked1080p}`);
+
+        await waitOrFound(800);
+        if (isFound()) return;
+
+        if (!hasBudget("playback nudge", 1200)) return;
+
+        await page.evaluate(() => {
+          const video = document.querySelector("video");
+          if (video) {
+            video.muted = true;
+            return video.play().catch(() => null);
+          }
+          return null;
+        }).catch(() => {});
+
+        await page.mouse.click(200, 300).catch(() => {});
+
+        await waitOrFound(6500);
+        if (isFound()) return;
+
+        if (!hasBudget("performance scan", 500)) return;
+
+        const perfUrls = await page.evaluate(() =>
+          performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
+        ).catch(() => []);
+
+        for (const u of perfUrls) {
+          considerUrl(u, "performance");
         }
+      };
 
-        if (!isFound()) {
-          // Step 5: Scan performance entries in case the request already fired silently.
-          const perfUrls = await page.evaluate(() =>
-            performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
-          ).catch(() => []);
-          for (const u of perfUrls) considerUrl(u, "performance");
-
-          await waitOrFound(2000);
-        }
-      }
+      // Do not race runFlow against sleep(timeout).
+      // Promise.race does not cancel runFlow, which was causing detached Frame errors
+      // when the page/context closed while quality-click code was still running.
+      await runFlow();
 
       const getCookiesTarget = typeof context.cookies === "function" ? context : page;
       const cookies = await getCookiesTarget.cookies(BASE_URL).catch(() => []);
@@ -1329,6 +1438,7 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
           getFileUrl: found.getFileUrl,
           cookieStr: newCookieStr,
         };
+
         setCachedBrowser1080p(cacheKey, value);
         return value;
       }
@@ -1339,12 +1449,13 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
       console.log(`[browser-1080p] error: ${e.message}`);
       return null;
     } finally {
-      if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
-      if (page) await page.close().catch(() => {});
-      if (context) await context.close().catch(() => {});
-      activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
-      scheduleSharedBrowserIdleClose();
-    }
+  if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
+  if (page) await page.close().catch(() => {});
+  if (context) await context.close().catch(() => {});
+
+  activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+  scheduleSharedBrowserIdleClose();
+}
   });
 }
 
@@ -1450,10 +1561,7 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
   };
 
   const resolveFallbackCandidates = async (sourceCandidates, label) => {
-    const resolveList = browserCanTry1080
-      // Browser is responsible for 1080p. Lightweight path only needs one fallback.
-      ? sourceCandidates.filter(c => c.quality !== "1080p").slice(0, MAX_RESOLVE_CANDIDATES)
-      : sourceCandidates.slice(0, MAX_RESOLVE_CANDIDATES);
+    const resolveList = sourceCandidates.slice(0, MAX_RESOLVE_CANDIDATES);
 
     console.log(
       `[meta] ${label} resolve list: ${
