@@ -846,16 +846,19 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
     const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
     if (cachedInsideQueue) return cachedInsideQueue;
 
-    const startedAt = Date.now();
-    const deadline = startedAt + BROWSER_1080P_TIMEOUT_MS;
-    const timeLeft = () => Math.max(500, deadline - Date.now());
-
     let context = null;
     let page = null;
 
     try {
+      // IMPORTANT:
+      // Launch can be slow on Render cold starts. Do not count launch time
+      // against the page/player runtime budget.
       const browser = await getSharedBrowser();
       if (!browser) return null;
+
+      const startedAt = Date.now();
+      const deadline = startedAt + BROWSER_1080P_TIMEOUT_MS;
+      const timeLeft = () => Math.max(750, deadline - Date.now());
 
       context = browser.createBrowserContext
         ? await browser.createBrowserContext()
@@ -863,8 +866,8 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
 
       page = await context.newPage();
 
-      page.setDefaultTimeout(Math.min(5000, timeLeft()));
-      page.setDefaultNavigationTimeout(Math.min(5000, timeLeft()));
+      page.setDefaultTimeout(Math.min(8000, timeLeft()));
+      page.setDefaultNavigationTimeout(Math.min(8000, timeLeft()));
 
       if (browser.__proxyAuth) {
         await page.authenticate(browser.__proxyAuth);
@@ -896,14 +899,10 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
         console.log(`[browser-1080p] seeded ${seededCookies.length} cookie(s)`);
       }
 
-      // IMPORTANT:
-      // This runs before the website/player JavaScript initializes.
-      // It is the browser equivalent of manually selecting 1080p once.
+      // This must run before the site's player scripts read localStorage.
       await page.evaluateOnNewDocument(() => {
         try {
           localStorage.setItem("kvsplayer_selected_format", "1080p");
-          localStorage.setItem("kvsplayer_test_storage", "test");
-          localStorage.setItem("flowplayerTestStorage", "test");
           localStorage.setItem("volume", "1");
         } catch {}
       });
@@ -953,7 +952,6 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
           try {
             decoded = decodeURIComponent(responseUrl);
           } catch {}
-
           console.log(`[browser-1080p] saw response: ${decoded}`);
         }
 
@@ -978,19 +976,17 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
           try {
             decoded = decodeURIComponent(reqUrl);
           } catch {}
-
           console.log(`[browser-1080p] saw request ${type}: ${decoded}`);
         }
 
         considerUrl(reqUrl, "request");
 
-        // Capture signed URLs, but never download video bytes in the Space/container.
+        // Capture signed URL, but do not download video bytes.
         if (/\/remote_control\.php\?/i.test(reqUrl)) {
           return req.abort().catch(() => {});
         }
 
-        // Keep this light, but do NOT block stylesheets for now.
-        // Some KVS controls/layouts behave badly if CSS is missing.
+        // Save bandwidth/CPU.
         if (["image", "font"].includes(type)) {
           return req.abort().catch(() => {});
         }
@@ -999,7 +995,7 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
           return req.abort().catch(() => {});
         }
 
-        // Allow player scripts/XHR/fetch. For media, allow get_file only.
+        // Let player scripts/XHR run. For media, allow only get_file.
         if (type === "media" && !/\/get_file\//i.test(reqUrl)) {
           return req.abort().catch(() => {});
         }
@@ -1013,120 +1009,41 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
         await page.goto(pageUrl, {
           referer: BASE_URL + "/",
           waitUntil: "domcontentloaded",
-          timeout: Math.min(5000, timeLeft()),
+          timeout: Math.min(8000, timeLeft()),
         }).catch(e => {
           console.log(`[browser-1080p] goto warning: ${e.message}`);
         });
 
-        // Verify the storage value is really present after navigation.
+        // Force again after navigation. This also confirms we are on a valid page origin.
         const selectedFormat = await page.evaluate(() => {
           try {
+            localStorage.setItem("kvsplayer_selected_format", "1080p");
+            localStorage.setItem("volume", "1");
             return localStorage.getItem("kvsplayer_selected_format");
-          } catch {
-            return null;
+          } catch (e) {
+            return `ERROR:${e.message}`;
           }
-        }).catch(() => null);
+        }).catch(e => `ERROR:${e.message}`);
 
         console.log(`[browser-1080p] localStorage selected_format=${selectedFormat || "(none)"}`);
 
-        // Force it again after navigation in case the site cleared/overrode it.
-        await page.evaluate(() => {
-          try {
-            localStorage.setItem("kvsplayer_selected_format", "1080p");
-            localStorage.setItem("kvsplayer_test_storage", "test");
-            localStorage.setItem("flowplayerTestStorage", "test");
-            localStorage.setItem("volume", "1");
-          } catch {}
-        }).catch(() => {});
+        await sleep(Math.min(500, timeLeft()));
 
-        await sleep(Math.min(400, timeLeft()));
-
-        // Start player more aggressively.
-        await page.evaluate(() => {
-          try {
-            const player = document.querySelector("#kt_player");
-            if (player) {
-              player.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
-              player.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              player.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              player.click();
-            }
-
-            const playButtons = [...document.querySelectorAll("button, a, div, span")]
-              .filter(el => {
-                const txt = (el.textContent || "").trim();
-                const cls = `${el.className || ""} ${el.id || ""}`;
-                const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
-                return /play/i.test(txt) || /play/i.test(cls) || /play/i.test(aria);
-              });
-
-            for (const el of playButtons.slice(0, 5)) {
-              try {
-                el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
-                el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-                el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-                el.click();
-              } catch {}
-            }
-
-            const video = document.querySelector("video");
-            if (video) {
-              video.muted = true;
-              video.volume = 0;
-              video.play().catch(() => null);
-            }
-          } catch {}
-        }).catch(() => {});
-
+        // Start player.
+        await page.click("#kt_player").catch(() => {});
         await page.mouse.click(200, 300).catch(() => {});
 
-        await sleep(Math.min(2200, timeLeft()));
+        // Nudge HTML5 playback if present.
+        await page.evaluate(() => {
+          const video = document.querySelector("video");
+          if (video) {
+            video.muted = true;
+            return video.play().catch(() => null);
+          }
+          return null;
+        }).catch(() => {});
 
-        // Some players only apply localStorage on reload. If we still saw nothing,
-        // reload once with the already-seeded localStorage.
-        if (!found.remoteControlUrl && !found.getFileUrl && timeLeft() > 1800) {
-          console.log("[browser-1080p] no media after first load; trying one reload with seeded localStorage");
-
-          await page.reload({
-            waitUntil: "domcontentloaded",
-            timeout: Math.min(3500, timeLeft()),
-          }).catch(e => {
-            console.log(`[browser-1080p] reload warning: ${e.message}`);
-          });
-
-          const selectedFormatAfterReload = await page.evaluate(() => {
-            try {
-              return localStorage.getItem("kvsplayer_selected_format");
-            } catch {
-              return null;
-            }
-          }).catch(() => null);
-
-          console.log(`[browser-1080p] after reload selected_format=${selectedFormatAfterReload || "(none)"}`);
-
-          await sleep(Math.min(300, timeLeft()));
-
-          await page.evaluate(() => {
-            try {
-              const player = document.querySelector("#kt_player");
-              if (player) {
-                player.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-                player.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-                player.click();
-              }
-
-              const video = document.querySelector("video");
-              if (video) {
-                video.muted = true;
-                video.volume = 0;
-                video.play().catch(() => null);
-              }
-            } catch {}
-          }).catch(() => {});
-
-          await page.mouse.click(200, 300).catch(() => {});
-          await sleep(Math.min(1600, timeLeft()));
-        }
+        await sleep(Math.min(3500, timeLeft()));
 
         const perfUrls = await page.evaluate(() =>
           performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
@@ -1164,14 +1081,8 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
       console.log(`[browser-1080p] error: ${e.message}`);
       return null;
     } finally {
-      if (page) {
-        await page.close().catch(() => {});
-      }
-
-      if (context) {
-        await context.close().catch(() => {});
-      }
-
+      if (page) await page.close().catch(() => {});
+      if (context) await context.close().catch(() => {});
       scheduleSharedBrowserIdleClose();
     }
   });
