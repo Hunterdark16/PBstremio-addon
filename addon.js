@@ -101,16 +101,15 @@ function cancelSharedBrowserIdleClose() {
 }
 
 const GENRE_TAG_SLUGS = {
-  "OnlyFans": ["onlyfans"],
-  "Amateur": ["amateur"],
-  "Milf": ["milf"],
-  "Teen": ["teen"],
-  "Anal": ["anal"],
-  "Blowjob": ["blowjob"],
-  "Lesbian": ["lesbian"],
-  "Interracial": ["interracial"],
-  "Solo": ["solo"],
-  "BDSM": ["bdsm"],
+  "Teen": "teen",
+  "Asian": "asian",
+  "Latina": "latina",
+  "Onlyfans": "onlyfans",
+  "PAWG": "pawg",
+  "Pornstar": "pornstar",
+  "Chaturbate": "chaturbate",
+  "Reverse Cowgirl": "reverse-cowgirl",
+  "Stepsister": "stepsister",
 };
 
 const PROXY_HOST = process.env.OUTBOUND_PROXY_HOST || "";
@@ -149,7 +148,17 @@ const manifest = {
         {
           name: "genre",
           isRequired: false,
-          options: ["OnlyFans", "Amateur", "Milf", "Teen", "Anal", "Blowjob", "Lesbian", "Interracial", "Solo", "BDSM"],
+          options: [
+  "Teen",
+  "Asian",
+  "Latina",
+  "Onlyfans",
+  "PAWG",
+  "Pornstar",
+  "Chaturbate",
+  "Reverse Cowgirl",
+  "Stepsister",
+],
         },
         { name: "skip", isRequired: false },
         { name: "search", isRequired: false },
@@ -308,56 +317,124 @@ async function getTaxonomyPrefix(testSlug) {
   return "tag";
 }
 
+const BAD_CATALOG_TITLE_RE = /^(home|about|contact|blog|videos?|models?|categories?|tags?|search|login|register|privacy|terms|dmca|sitemap|upload and earn|verified|male|female|become a model|affiliate program|advertise|members?|join|sign up|signup)$/i;
+
+const BAD_CATALOG_SLUG_RE = /^(home|about|contact|blog|videos?|models?|categories?|tags?|search|login|register|privacy|terms|dmca|sitemap|upload-and-earn|verified|male|female|become-a-model|affiliate-program|advertise|members?|join|sign-up|signup)$/i;
+
+function cleanCatalogText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, "")
+    .trim();
+}
+
+function titleFromVideoSlug(slug) {
+  return cleanCatalogText(
+    String(slug || "")
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, c => c.toUpperCase())
+  );
+}
+
+function isRealVideoPath(pathname) {
+  const path = cleanSlugPath(pathname);
+  const segments = path.split("/").filter(Boolean);
+
+  // Only allow real video pages:
+  // /videos/some-video-title/
+  if (segments.length !== 2) return false;
+  if (segments[0] !== "videos") return false;
+
+  const slug = segments[1];
+
+  if (!slug) return false;
+  if (/^\d+$/.test(slug)) return false;
+  if (!slug.includes("-")) return false;
+  if (slug.length < 8) return false;
+  if (BAD_CATALOG_SLUG_RE.test(slug)) return false;
+
+  return true;
+}
+
 function extractPostCards(html, baseUrl) {
   const $ = cheerio.load(html);
   const siteBase = baseUrl || BASE_URL;
+
   const siteHostname = (() => {
-    try { return new URL(siteBase).hostname; } catch { return ""; }
+    try {
+      return new URL(siteBase).hostname;
+    } catch {
+      return "";
+    }
   })();
 
   const results = [];
-  const seenHref = new Set();
+  const seenVideoPaths = new Set();
 
   $("a[href]").each((_, el) => {
     const a = $(el);
     const rawHref = a.attr("href");
     if (!rawHref) return;
 
-    let href;
-    try { href = new URL(rawHref, siteBase).toString(); } catch { return; }
-
     let u;
     try {
-      u = new URL(href);
-      if (u.hostname !== siteHostname) return;
-    } catch { return; }
+      u = new URL(rawHref, siteBase);
+    } catch {
+      return;
+    }
 
-    if (/^\/(page|tag|tags|category|categories|author|search|wp-|feed|#|genre|niche)/i.test(u.pathname)) return;
-    if (/\/page\/\d+/i.test(u.pathname)) return;
-    if (u.pathname === "/" || u.pathname === "") return;
-    if (!/-/.test(u.pathname)) return;
+    if (u.hostname !== siteHostname) return;
 
-    const segments = u.pathname.replace(/^\/|\/$/g, "").split("/");
-    if (segments.length === 1 && segments[0].length < 5) return;
+    // Main fix: only accept /videos/<slug>/ URLs.
+    if (!isRealVideoPath(u.pathname)) return;
 
-    if (seenHref.has(href)) return;
-    seenHref.add(href);
+    const pathKey = cleanSlugPath(u.pathname);
+    if (seenVideoPaths.has(pathKey)) return;
+    seenVideoPaths.add(pathKey);
 
-    const container = a.closest(
-      "article, .post, [class*='post'], [class*='item'], [class*='card'], [class*='thumb'], [class*='entry'], li, div"
+    const slug = pathKey.split("/").pop();
+
+    // Keep this narrow. Do NOT use generic "li, div" here,
+    // because those can climb into nav/sidebar/model blocks.
+    const closestCard = a.closest(
+      "article, .video, .video-item, .thumb, .thumbnail, .item, .card, .post, [class*='video'], [class*='thumb']"
     );
 
-    const title =
-      a.attr("title") ||
-      container.find("h1, h2, h3, h4, [class*='title'], [class*='name']").first().text().trim() ||
-      a.find("h1, h2, h3, h4, [class*='title']").first().text().trim() ||
-      a.text().trim() ||
-      segments[segments.length - 1].replace(/-/g, " ");
+    const container = closestCard.length ? closestCard : a;
 
-    if (!title || title.length < 3) return;
-    if (/^(home|about|contact|blog|videos|models|categories|tags|search|login|register|privacy|terms|dmca|sitemap)$/i.test(title.trim())) return;
+    const imgNode =
+      a.find("img").first().length
+        ? a.find("img").first()
+        : container.find("img").first();
 
-    const imgNode = container.find("img").first();
+    const rawTitleCandidates = [
+      a.attr("title"),
+      imgNode.attr("alt"),
+      imgNode.attr("title"),
+      a.find("[class*='title'], [class*='name']").first().text(),
+      container.find("[class*='title']").first().text(),
+      a.text(),
+      titleFromVideoSlug(slug),
+    ];
+
+    let title = "";
+
+    for (const candidate of rawTitleCandidates) {
+      const cleaned = cleanCatalogText(candidate);
+      if (!cleaned) continue;
+      if (cleaned.length < 3) continue;
+      if (BAD_CATALOG_TITLE_RE.test(cleaned)) continue;
+
+      title = cleaned;
+      break;
+    }
+
+    if (!title) {
+      title = titleFromVideoSlug(slug);
+    }
+
+    if (!title || BAD_CATALOG_TITLE_RE.test(title)) return;
+
     const rawImg = absoluteUrl(
       imgNode.attr("data-src") ||
       imgNode.attr("data-lazy-src") ||
@@ -366,41 +443,53 @@ function extractPostCards(html, baseUrl) {
       (() => {
         const ss = imgNode.attr("srcset");
         if (!ss) return null;
-        const m = ss.match(/https?:\/\/[^ ,]+/);
-        return m ? m[0] : null;
+
+        const first = ss
+          .split(",")
+          .map(x => x.trim().split(/\s+/)[0])
+          .find(Boolean);
+
+        return first || null;
       })() ||
-      imgNode.attr("src")
+      imgNode.attr("src"),
+      siteBase
     );
 
-    const imgOk = rawImg && !/(placeholder|avatar|logo|icon|blank|spacer|pixel|\.gif)/i.test(rawImg);
+    const imgOk =
+      rawImg &&
+      !/(placeholder|avatar|logo|icon|blank|spacer|pixel|\.gif)/i.test(rawImg);
+
     const img = imgOk
-      ? (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/imgproxy?url=${encodeURIComponent(rawImg)}` : rawImg)
+      ? (PUBLIC_BASE_URL
+          ? `${PUBLIC_BASE_URL}/imgproxy?url=${encodeURIComponent(rawImg)}`
+          : rawImg)
       : undefined;
 
-    const description = container
-      .find("[class*='desc'], [class*='excerpt'], [class*='summary'], p")
-      .first().text().trim().substring(0, 200);
+    const description = cleanCatalogText(
+      container
+        .find("[class*='desc'], [class*='excerpt'], [class*='summary'], p")
+        .first()
+        .text()
+    ).substring(0, 200);
 
     const date =
       container.find("time").attr("datetime") ||
-      container.find("[class*='date'], [class*='time']").first().text().trim();
+      cleanCatalogText(container.find("[class*='date'], [class*='time']").first().text());
 
     results.push({
-      id: makeIdFromPath(u.pathname),
+      id: makeIdFromPath(pathKey),
       type: "movie",
       name: title,
       poster: img,
       posterShape: "landscape",
       background: img,
       description: [date, description].filter(Boolean).join(" • "),
-      website: href,
+      website: u.toString(),
     });
   });
 
-  const seen = new Set();
-  const deduped = results.filter(x => x.id && !seen.has(x.id) && (seen.add(x.id), true));
-  console.log(`[catalog] extractPostCards found ${deduped.length} items`);
-  return deduped.slice(0, 24);
+  console.log(`[catalog] extractPostCards found ${results.length} video items`);
+  return results.slice(0, 24);
 }
 
 async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
@@ -426,35 +515,29 @@ async function fetchCatalogPage(_catalogId, skip = 0, search = "", genre = "") {
   }
 
   if (genre && GENRE_TAG_SLUGS[genre]) {
-    const prefix = await getTaxonomyPrefix(GENRE_TAG_SLUGS[genre][0]);
-    const allMetas = [];
-    const seen = new Set();
+  const slug = GENRE_TAG_SLUGS[genre];
 
-    for (const slug of GENRE_TAG_SLUGS[genre]) {
-      const urls = [
-        `${BASE_URL}/${prefix}/${slug}/${page > 1 ? `page/${page}/` : ""}`,
-        `${BASE_URL}/${prefix}/${slug}${page > 1 ? `/?paged=${page}` : "/"}`,
-      ];
+  const tagUrl = page <= 1
+    ? `${BASE_URL}/tags/${slug}/`
+    : `${BASE_URL}/tags/${slug}/${page}/`;
 
-      for (const genreUrl of urls) {
-        try {
-          const html = await fetchHtml(genreUrl);
-          const metas = extractPostCards(html);
-          for (const m of metas) {
-            if (!seen.has(m.id)) {
-              seen.add(m.id);
-              allMetas.push(m);
-            }
-          }
-          if (allMetas.length > 0) break;
-        } catch (err) {
-          console.warn(`Genre "${slug}" @ ${genreUrl} failed: ${err.message}`);
-        }
-      }
+  try {
+    console.log(`[catalog] fetching genre "${genre}" from ${tagUrl}`);
+
+    const html = await fetchHtml(tagUrl);
+    const metas = extractPostCards(html, tagUrl);
+
+    if (metas.length > 0) {
+      return metas;
     }
 
-    if (allMetas.length > 0) return allMetas;
+    console.warn(`[catalog] genre "${genre}" returned no video metas from ${tagUrl}`);
+  } catch (err) {
+    console.warn(`[catalog] genre "${genre}" fetch failed: ${tagUrl} -> ${err.message}`);
   }
+
+  return [];
+}
 
   const catalogUrl = page <= 1
   ? `${BASE_URL}/videos/`
