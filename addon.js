@@ -32,6 +32,14 @@ let sharedBrowser = null;
 let sharedBrowserLaunchPromise = null;
 let browserIdleTimer = null;
 let browserJobQueue = Promise.resolve();
+let activeBrowserJobs = 0;
+
+function cancelSharedBrowserIdleClose() {
+  if (browserIdleTimer) {
+    clearTimeout(browserIdleTimer);
+    browserIdleTimer = null;
+  }
+}
 
 const GENRE_TAG_SLUGS = {
   "OnlyFans": ["onlyfans"],
@@ -754,12 +762,21 @@ async function closeSharedBrowser(reason = "idle") {
 
 function scheduleSharedBrowserIdleClose() {
   if (browserIdleTimer) clearTimeout(browserIdleTimer);
+
   browserIdleTimer = setTimeout(() => {
+    if (activeBrowserJobs > 0) {
+      console.log(`[browser-1080p] idle close skipped; ${activeBrowserJobs} active browser job(s)`);
+      scheduleSharedBrowserIdleClose();
+      return;
+    }
+
     closeSharedBrowser("idle-timeout").catch(() => {});
   }, BROWSER_IDLE_TTL_MS);
 }
 
 async function getSharedBrowser() {
+  cancelSharedBrowserIdleClose();
+
   if (isBrowserConnected(sharedBrowser)) return sharedBrowser;
   if (sharedBrowserLaunchPromise) return sharedBrowserLaunchPromise;
 
@@ -863,13 +880,20 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
   if (cached) return cached;
 
   return enqueueBrowserJob(async () => {
-    const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
-    if (cachedInsideQueue) return cachedInsideQueue;
+  activeBrowserJobs++;
+  cancelSharedBrowserIdleClose();
 
-    let context = null;
-    let page = null;
+  const cachedInsideQueue = getCachedBrowser1080p(cacheKey);
+  if (cachedInsideQueue) {
+    activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+    scheduleSharedBrowserIdleClose();
+    return cachedInsideQueue;
+  }
 
-    try {
+  let context = null;
+  let page = null;
+
+  try {
       // IMPORTANT:
       // Launch can be slow on Render cold starts. Do not count launch time
       // against the page/player runtime budget.
@@ -1216,10 +1240,12 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
       console.log(`[browser-1080p] error: ${e.message}`);
       return null;
     } finally {
-      if (page) await page.close().catch(() => {});
-      if (context) await context.close().catch(() => {});
-      scheduleSharedBrowserIdleClose();
-    }
+  if (page) await page.close().catch(() => {});
+  if (context) await context.close().catch(() => {});
+
+  activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+  scheduleSharedBrowserIdleClose();
+}
   });
 }
 
