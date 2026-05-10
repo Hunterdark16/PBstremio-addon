@@ -960,9 +960,10 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
     found.getFileUrl = rawUrl;
     console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
 
-    // Do not resolve foundPromise here.
-    // Waiting a little longer lets Chromium see the 302 Location header and capture
-    // the final remote_control.php URL directly, avoiding one extra server resolve request.
+    // This is enough. We can resolve this get_file server-side afterwards.
+    // Do not keep Chromium running for another 20-30s waiting for remote_control,
+    // because some videos redirect to direct st*.mp4 instead.
+    resolveFound("get_file");
   }
 }
       };
@@ -1026,7 +1027,7 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
         return req.continue().catch(() => {});
       });
 
-            const isFound = () => !!found.remoteControlUrl;
+            const isFound = () => !!found.remoteControlUrl || !!found.getFileUrl;
 
       const remaining = (maxMs) => {
         const left = deadline - Date.now();
@@ -1247,16 +1248,34 @@ async function resolveCapturedBrowserGetFile(getFileUrl, pageUrl, cookieStr) {
     }, true);
 
     const location = res.headers.get("location");
+    const contentType = res.headers.get("content-type") || "";
     const status = res.status;
+
     res.body?.destroy?.();
 
     console.log(`[browser-1080p] captured get_file status=${status} location=${location || "(none)"}`);
 
-    if (location && /remote_control\.php/i.test(location)) {
-      return new URL(location, resolveUrl).toString();
+    if (location) {
+      const resolved = new URL(location, resolveUrl).toString();
+
+      let decoded = resolved;
+      try {
+        decoded = decodeURIComponent(resolved);
+      } catch {}
+
+      if (/\/remote_control\.php\?/i.test(resolved) && /\.mp4/i.test(decoded)) {
+        console.log(`[browser-1080p] ✅ captured get_file resolved to remote_control: ${decoded}`);
+        return resolved;
+      }
+
+      if (/\.mp4(?:[?#]|$)/i.test(decoded)) {
+        console.log(`[browser-1080p] ✅ captured get_file resolved to direct mp4: ${decoded}`);
+        return resolved;
+      }
     }
 
-    if (status === 200 || status === 206) {
+    if ((status === 200 || status === 206) && /video|octet-stream/i.test(contentType)) {
+      console.log(`[browser-1080p] ✅ captured get_file itself appears playable`);
       return resolveUrl;
     }
   } catch (e) {
