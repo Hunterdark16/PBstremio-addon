@@ -1657,7 +1657,7 @@ if (browserCanTry1080 && !has1080pUrl(deduped)) {
     console.log("[meta] tiny browser get_file did not resolve");
   }
 }
-
+}
   const finalDeduped = dedupeUrls(deduped);
 
   console.log(
