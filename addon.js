@@ -3,6 +3,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const cheerio = require("cheerio");
 const { HttpsProxyAgent } = require("https-proxy-agent");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 7860;
 const BASE_URL = process.env.PB_BASE_URL || "https://pimpbunny.com";
@@ -27,6 +28,33 @@ const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 
 // Cheap caches to avoid duplicate Stremio/UI requests.
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
 const CATALOG_CACHE_MS = Number(process.env.CATALOG_CACHE_MS || 10 * 60 * 1000);
+const STREAM_TOKEN_TTL_MS = Number(process.env.STREAM_TOKEN_TTL_MS || 10 * 60 * 1000);
+const streamTokenCache = new Map();
+
+function createStreamToken(targetUrl, referer, cookieStr = "") {
+  const token = crypto.randomBytes(16).toString("hex");
+
+  streamTokenCache.set(token, {
+    targetUrl,
+    referer,
+    cookieStr,
+    expiresAt: Date.now() + STREAM_TOKEN_TTL_MS,
+  });
+
+  return token;
+}
+
+function getStreamToken(token) {
+  const entry = streamTokenCache.get(token);
+  if (!entry) return null;
+
+  if (entry.expiresAt <= Date.now()) {
+    streamTokenCache.delete(token);
+    return null;
+  }
+
+  return entry;
+}
 
 const browser1080pCache = new Map();
 let sharedBrowser = null;
@@ -116,6 +144,9 @@ setInterval(() => {
   for (const [key, val] of catalogCache.entries()) {
     if (val.expiresAt <= now) catalogCache.delete(key);
   }
+  for (const [key, val] of streamTokenCache.entries()) {
+  if (val.expiresAt <= now) streamTokenCache.delete(key);
+}
 }, 15 * 60 * 1000);
 
 const HEADERS = {
@@ -1013,9 +1044,10 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
   }
 
   let context = null;
-  let page = null;
+let page = null;
+let getFileGraceTimer = null;
 
-  try {
+try {
       // IMPORTANT:
       // Launch can be slow on Render cold starts. Do not count launch time
       // against the page/player runtime budget.
@@ -1083,7 +1115,7 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
         resolveFound = resolve;
       });
 
-      let getFileGraceTimer = null;
+    
 
 const finishFound = (reason) => {
   if (resolveFound) {
@@ -1735,7 +1767,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
   }
 });
 
-function buildStreamObjects(videoUrls, pageUrl) {
+function buildStreamObjects(videoUrls, pageUrl, cookieStr = "") {
   const qualityLabels = {
     "_1080p": "1080p",
     "_720p": "720p",
@@ -1748,9 +1780,13 @@ function buildStreamObjects(videoUrls, pageUrl) {
     try { decoded = decodeURIComponent(u); } catch {}
 
     const label = Object.entries(qualityLabels).find(([k]) => decoded.includes(k))?.[1] ?? "HD";
-    const streamUrl = PUBLIC_BASE_URL
-      ? `${PUBLIC_BASE_URL}/proxy?url=${encodeURIComponent(u)}&ref=${encodeURIComponent(pageUrl)}`
-      : u;
+
+    let streamUrl = u;
+
+    if (PUBLIC_BASE_URL) {
+      const token = createStreamToken(u, pageUrl, cookieStr);
+      streamUrl = `${PUBLIC_BASE_URL}/proxy?t=${encodeURIComponent(token)}`;
+    }
 
     return {
       name: "PimpBunny 🎥",
@@ -1776,19 +1812,19 @@ builder.defineStreamHandler(async ({ type, id }) => {
       Date.now() - cached.updatedAt < STREAM_CACHE_MS
     ) {
       console.log(`[stream] short cache hit for ${id}`);
-      const streams = buildStreamObjects(cached.videoUrls, pageUrl);
+      const streams = buildStreamObjects(cached.videoUrls, pageUrl, cached.cookieStr || "");
       return { streams };
     }
 
     console.log(`[stream] fresh scrape for ${id}`);
-    const { videoUrls } = await scrapeMetaById(id, { resolveStreams: true });
+    const { videoUrls, cookieStr } = await scrapeMetaById(id, { resolveStreams: true });
 
     if (!videoUrls || videoUrls.length === 0) {
       console.log(`[stream] no playable URLs found`);
       return { streams: [{ name: "PimpBunny 🔗", title: "Open Page", externalUrl: pageUrl }] };
     }
 
-    const streams = buildStreamObjects(videoUrls, pageUrl);
+    const streams = buildStreamObjects(videoUrls, pageUrl, cookieStr || "");
 
     console.log(`[stream] returning ${streams.length} stream(s), first: ${streams[0]?.url?.substring(0, 80)}`);
     return { streams };
@@ -1837,20 +1873,38 @@ app.get("/imgproxy", async (req, res) => {
 app.get("/proxy", async (req, res) => {
   const rawQuery = req._parsedUrl?.query || require("url").parse(req.url).query || "";
 
+let decodedTarget = null;
+let referer = BASE_URL + "/";
+let proxyCookieStr = "";
+
+const tokenMatch = rawQuery.match(/(?:^|&)(?:t|token)=([^&]*)/);
+
+if (tokenMatch) {
+  const token = decodeURIComponent(tokenMatch[1]);
+  const tokenData = getStreamToken(token);
+
+  if (!tokenData) {
+    return res.status(410).type("text/plain").send("stream token expired");
+  }
+
+  decodedTarget = tokenData.targetUrl;
+  referer = tokenData.referer || BASE_URL + "/";
+  proxyCookieStr = tokenData.cookieStr || "";
+} else {
   const urlMatch = rawQuery.match(/(?:^|&)url=([^&]*)/);
   const target = urlMatch ? urlMatch[1] : null;
   if (!target) return res.status(400).send("missing url");
 
   const refMatch = rawQuery.match(/(?:^|&)ref=([^&]*)/);
-  const referer = refMatch ? decodeURIComponent(refMatch[1]) : BASE_URL + "/";
+  referer = refMatch ? decodeURIComponent(refMatch[1]) : BASE_URL + "/";
 
-  let decodedTarget;
   try {
     decodedTarget = decodeURIComponent(target);
   } catch (e) {
     console.warn(`[proxy] decode error: ${e.message}`);
     decodedTarget = target;
   }
+}
 
   const isSegment = SEGMENT_RE.test(decodedTarget.split("?")[0]);
   const isRemoteControl = /\/remote_control\.php\?/i.test(decodedTarget);
@@ -1864,13 +1918,14 @@ app.get("/proxy", async (req, res) => {
 
   try {
     const fetchHeaders = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-      "Referer": referer,
-      "Origin": BASE_URL,
-      "Accept": VIDEO_HEADERS.Accept,
-      "Accept-Language": "en-US,en;q=0.9",
-      "Connection": "keep-alive",
-    };
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "Referer": referer,
+  "Origin": BASE_URL,
+  "Accept": VIDEO_HEADERS.Accept,
+  "Accept-Language": "en-US,en;q=0.9",
+  "Connection": "keep-alive",
+  ...(proxyCookieStr ? { Cookie: proxyCookieStr } : {}),
+};
 
     if (req.headers.range) {
       fetchHeaders.Range = req.headers.range;
