@@ -22,6 +22,7 @@ const BROWSER_1080P_TIMEOUT_MS = Number(process.env.BROWSER_1080P_TIMEOUT_MS || 
 const BROWSER_1080P_CACHE_MS = Number(process.env.BROWSER_1080P_CACHE_MS || 180 * 1000);
 const BROWSER_IDLE_TTL_MS = Number(process.env.BROWSER_IDLE_TTL_MS || 30 * 1000);
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 1200);
 
 // Cheap caches to avoid duplicate Stremio/UI requests.
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
@@ -699,6 +700,127 @@ function getFilePathForDedupe(u) {
   }
 }
 
+function replaceQualityWith1080(value) {
+  const s = String(value || "");
+  if (!/_(720p|480p|360p)\.mp4/i.test(s)) return null;
+  return s.replace(/_(720p|480p|360p)\.mp4/i, "_1080p.mp4");
+}
+
+function deriveFast1080CandidateFromResolvedUrl(resolvedUrl) {
+  if (!resolvedUrl) return null;
+
+  let decoded = String(resolvedUrl);
+  try { decoded = decodeURIComponent(decoded); } catch {}
+
+  try {
+    const u = new URL(resolvedUrl);
+
+    // Case 1: direct storage URL:
+    // https://st33.pimpbunny.com/videos/562000/562845/562845_720p.mp4
+    if (/\.mp4(?:[?#]|$)/i.test(decoded) && !/\/remote_control\.php/i.test(u.pathname)) {
+      const upgradedPath = replaceQualityWith1080(u.pathname);
+      if (!upgradedPath || upgradedPath === u.pathname) return null;
+
+      u.pathname = upgradedPath;
+      u.search = "";
+      return u.toString();
+    }
+
+    // Case 2: signed remote_control URL:
+    // Try direct path on same media host, but verify before using.
+    if (/\/remote_control\.php/i.test(u.pathname)) {
+      const file = u.searchParams.get("file");
+      if (!file) return null;
+
+      const upgradedFile = replaceQualityWith1080(file);
+      if (!upgradedFile || upgradedFile === file) return null;
+
+      const path = upgradedFile.startsWith("/") ? upgradedFile : `/${upgradedFile}`;
+      return `${u.protocol}//${u.host}${path}`;
+    }
+  } catch {}
+
+  return null;
+}
+
+async function verifyFast1080Url(candidateUrl, pageUrl, cookieStr) {
+  if (!candidateUrl) return null;
+
+  let decoded = String(candidateUrl);
+  try { decoded = decodeURIComponent(decoded); } catch {}
+
+  if (!/_1080p\.mp4/i.test(decoded)) return null;
+
+  console.log(`[fast-1080p] verifying candidate: ${decoded}`);
+
+  let res = null;
+  try {
+    res = await doFetch(candidateUrl, {
+      headers: {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": VIDEO_HEADERS.Accept,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity;q=1, *;q=0",
+        "Range": "bytes=0-0",
+        "Referer": pageUrl,
+        "Origin": BASE_URL,
+        ...(cookieStr ? { Cookie: cookieStr } : {}),
+      },
+      redirect: "manual",
+    }, true);
+
+    const status = res.status;
+    const location = res.headers.get("location");
+    const contentType = res.headers.get("content-type") || "";
+    const contentRange = res.headers.get("content-range") || "";
+    const acceptRanges = res.headers.get("accept-ranges") || "";
+
+    res.body?.destroy?.();
+
+    console.log(`[fast-1080p] status=${status} location=${location || "(none)"}`);
+
+    if (location) {
+      const resolved = new URL(location, candidateUrl).toString();
+
+      let resolvedDecoded = resolved;
+      try { resolvedDecoded = decodeURIComponent(resolved); } catch {}
+
+      if (/_1080p\.mp4/i.test(resolvedDecoded) && (/\.mp4/i.test(resolvedDecoded) || /remote_control\.php/i.test(resolvedDecoded))) {
+        console.log(`[fast-1080p] ✅ verified via redirect: ${resolvedDecoded}`);
+        return resolved;
+      }
+    }
+
+    const looksLikeMedia =
+      /video|octet-stream/i.test(contentType) ||
+      /bytes/i.test(contentRange) ||
+      /bytes/i.test(acceptRanges);
+
+    if ((status === 200 || status === 206) && looksLikeMedia) {
+      console.log(`[fast-1080p] ✅ verified direct 1080p: ${decoded}`);
+      return candidateUrl;
+    }
+  } catch (e) {
+    res?.body?.destroy?.();
+    console.log(`[fast-1080p] verify failed: ${e.message}`);
+  }
+
+  console.log(`[fast-1080p] ❌ candidate not usable`);
+  return null;
+}
+
+async function tryFast1080FromFallback(videoUrls, pageUrl, cookieStr) {
+  for (const fallbackUrl of videoUrls || []) {
+    const candidate = deriveFast1080CandidateFromResolvedUrl(fallbackUrl);
+    if (!candidate) continue;
+
+    const verified = await verifyFast1080Url(candidate, pageUrl, cookieStr);
+    if (verified) return verified;
+  }
+
+  return null;
+}
+
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -961,36 +1083,59 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
         resolveFound = resolve;
       });
 
-      const considerUrl = (rawUrl, source) => {
-        if (!rawUrl) return;
+      let getFileGraceTimer = null;
 
-        let decoded = rawUrl;
-        try {
-          decoded = decodeURIComponent(rawUrl);
-        } catch {}
-
-        if (!decoded.includes(String(videoId))) return;
-
-        if (/\/remote_control\.php\?/i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
-          if (!found.remoteControlUrl) {
-            found.remoteControlUrl = rawUrl;
-            console.log(`[browser-1080p] captured 1080p remote_control from ${source}: ${decoded}`);
-            resolveFound("remote");
-          }
-        }
-
-        if (/\/get_file\//i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
-  if (!found.getFileUrl) {
-    found.getFileUrl = rawUrl;
-    console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
-
-    // This is enough. We can resolve this get_file server-side afterwards.
-    // Do not keep Chromium running for another 20-30s waiting for remote_control,
-    // because some videos redirect to direct st*.mp4 instead.
-    resolveFound("get_file");
+const finishFound = (reason) => {
+  if (resolveFound) {
+    const fn = resolveFound;
+    resolveFound = null;
+    fn(reason);
   }
-}
-      };
+};
+
+const scheduleGetFileGraceResolve = () => {
+  if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
+
+  getFileGraceTimer = setTimeout(() => {
+    if (found.getFileUrl && !found.remoteControlUrl) {
+      console.log(`[browser-1080p] get_file grace elapsed; resolving captured get_file`);
+      finishFound("get_file");
+    }
+  }, GETFILE_CAPTURE_GRACE_MS);
+
+  getFileGraceTimer.unref?.();
+};
+
+const considerUrl = (rawUrl, source) => {
+  if (!rawUrl) return;
+
+  let decoded = rawUrl;
+  try {
+    decoded = decodeURIComponent(rawUrl);
+  } catch {}
+
+  if (!decoded.includes(String(videoId))) return;
+
+  if (/\/remote_control\.php\?/i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
+    if (!found.remoteControlUrl) {
+      found.remoteControlUrl = rawUrl;
+      console.log(`[browser-1080p] captured 1080p remote_control from ${source}: ${decoded}`);
+      finishFound("remote");
+    }
+    return;
+  }
+
+  if (/\/get_file\//i.test(rawUrl) && /_1080p\.mp4/i.test(decoded)) {
+    if (!found.getFileUrl) {
+      found.getFileUrl = rawUrl;
+      console.log(`[browser-1080p] captured 1080p get_file from ${source}: ${decoded}`);
+
+      // Wait briefly for Chromium to expose a 302 Location header.
+      // If it does not, resolve the captured get_file ourselves.
+      scheduleGetFileGraceResolve();
+    }
+  }
+};
 
       page.on("response", res => {
         const responseUrl = res.url();
@@ -1240,6 +1385,7 @@ const timeLeft = () => Math.max(0, deadline - Date.now());
       console.log(`[browser-1080p] error: ${e.message}`);
       return null;
     } finally {
+  if (getFileGraceTimer) clearTimeout(getFileGraceTimer);
   if (page) await page.close().catch(() => {});
   if (context) await context.close().catch(() => {});
 
@@ -1409,8 +1555,17 @@ async function resolveVideoUrlsFromHtml(html, pageUrl, videoId, cookieStr) {
 
   let deduped = dedupeUrls(videoUrls);
 
-  if (browserCanTry1080 && !has1080pUrl(deduped)) {
-    console.log("[meta] no 1080p from lightweight resolver; trying tiny browser resolver");
+if (!has1080pUrl(deduped)) {
+  const fast1080 = await tryFast1080FromFallback(deduped, pageUrl, cookieStr);
+
+  if (fast1080) {
+    console.log("[meta] ✅ fast direct 1080p verified; browser resolver skipped");
+    deduped.unshift(fast1080);
+  }
+}
+
+if (browserCanTry1080 && !has1080pUrl(deduped)) {
+  console.log("[meta] no 1080p from lightweight/fast resolver; trying tiny browser resolver");
 
     const browser1080p = await resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr);
 
