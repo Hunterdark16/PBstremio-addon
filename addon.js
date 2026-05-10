@@ -1219,11 +1219,11 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
 
       console.log(`[browser-1080p] opening page ${pageUrl}`);
 
-      await page.goto(pageUrl, {
-        referer: BASE_URL + "/",
-        waitUntil: "domcontentloaded",
-        timeout: remaining(12000),
-      }).catch(e => console.log(`[browser-1080p] goto warning: ${e.message}`));
+     await page.goto(pageUrl, {
+          referer: BASE_URL + "/",
+          waitUntil: "load",
+          timeout: remaining(12000),
+        }).catch(e => console.log(`[browser-1080p] goto warning: ${e.message}`));
 
       if (isFound()) {
         // Already got it from a request fired during page load — done.
@@ -1239,32 +1239,42 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
 
         // Step 2: Extract the 1080p get_file URL directly from the KVS player config
         // in the page source — this is the fastest possible path and doesn't require
-        // waiting for the player to autoplay or the user to click anything.
-        const extractedUrl = await page.evaluate((vid) => {
-          try {
-            // KVS player sets up a global config object. Find the 1080p source directly.
-            const scripts = [...document.querySelectorAll("script")];
-            for (const s of scripts) {
-              const t = s.textContent || "";
-              // Look for the video_url or video_alt_url assignment that contains 1080p.
-              const patterns = [
-                /video_url\s*:\s*['"`]((?:function\/\d+\/)?https?:\/\/[^'"`]+1080p[^'"`]*\.mp4[^'"`]*?)['"`]/i,
-                /video_alt_url\d*\s*:\s*['"`]((?:function\/\d+\/)?https?:\/\/[^'"`]+1080p[^'"`]*\.mp4[^'"`]*?)['"`]/i,
-              ];
-              for (const re of patterns) {
-                const m = t.match(re);
-                if (m && m[1].includes(String(vid))) return m[1];
-              }
-            }
-          } catch {}
-          return null;
-        }, videoId).catch(() => null);
+        // waiting for the player to fire its XHR.
+        if (!isFound()) {
+          const extractedGetFile = await page.evaluate((vid) => {
+            try {
+              for (const s of document.querySelectorAll("script:not([src])")) {
+                const t = s.textContent || "";
+                if (!t.includes("get_file") || !t.includes(String(vid))) continue;
 
-        if (extractedUrl) {
-          console.log(`[browser-1080p] extracted 1080p get_file from DOM: ${extractedUrl}`);
-          // Strip the function/0/ wrapper if present (KVS format).
-          const cleaned = extractedUrl.replace(/^function\/\d+\//i, "");
-          considerUrl(cleaned, "dom-extract");
+                // Match both plain URLs and function/N/ wrapped KVS format, with any quoting.
+                const patterns = [
+                  /video_url\s*:\s*['"`]([^'"`]+\/get_file\/[^'"`]+_1080p\.mp4[^'"`]*?)['"`]/i,
+                  /video_alt_url\d*\s*:\s*['"`]([^'"`]+\/get_file\/[^'"`]+_1080p\.mp4[^'"`]*?)['"`]/i,
+                  /((?:function\/\d+\/)?https?:\/\/[^\s'"`\\]+\/get_file\/[^\s'"`\\]+_1080p\.mp4\/?)/i,
+                ];
+
+                for (const re of patterns) {
+                  const m = t.match(re);
+                  if (!m) continue;
+                  let url = m[1];
+                  // Unwrap KVS function/N/ prefix.
+                  url = url.replace(/^function\/\d+\//i, "");
+                  // Decode common JS escape sequences.
+                  url = url.replace(/\\u002f/gi, "/").replace(/\\u0026/gi, "&").replace(/\\\//g, "/");
+                  if (url.startsWith("http") && url.includes(String(vid))) return url;
+                }
+              }
+            } catch {}
+            return null;
+          }, videoId).catch(() => null);
+
+          if (extractedGetFile) {
+            console.log(`[browser-1080p] fast DOM extract: ${extractedGetFile}`);
+            considerUrl(extractedGetFile, "dom-extract");
+          } else {
+            console.log(`[browser-1080p] DOM extract: no 1080p URL found in inline scripts`);
+          }
         }
 
         // Step 3: If DOM extraction gave us a get_file, the grace timer is already running.
