@@ -1007,17 +1007,21 @@ async function resolve1080pViaTinyBrowser(pageUrl, videoId, cookieStr) {
 console.log(`[browser-1080p] opening lightweight embed ${targetUrl}`);
 
 const runFlow = async () => {
+  // Use the full page, not /embed/<id>.
+  // The embed page is lighter, but logs show it only requests the base .mp4.
+  const targetUrl = pageUrl;
+
+  console.log(`[browser-1080p] opening lightweight full page ${targetUrl}`);
+
   await page.goto(targetUrl, {
-    referer: pageUrl,
+    referer: BASE_URL + "/",
     waitUntil: "domcontentloaded",
-    timeout: Math.min(9000, timeLeft()),
+    timeout: Math.min(8000, timeLeft()),
   }).catch(e => {
     console.log(`[browser-1080p] goto warning: ${e.message}`);
   });
 
-  await sleep(Math.min(500, timeLeft()));
-
-  // Force again after navigation. This confirms the page origin allows localStorage.
+  // Force localStorage after navigation too.
   const selectedFormat = await page.evaluate(() => {
     try {
       localStorage.setItem("kvsplayer_selected_format", "1080p");
@@ -1030,21 +1034,25 @@ const runFlow = async () => {
 
   console.log(`[browser-1080p] localStorage selected_format=${selectedFormat || "(none)"}`);
 
-  // Start / wake the player on the embed page.
-  await page.evaluate(() => {
+  await sleep(Math.min(600, timeLeft()));
+
+  // Start player.
+  await page.click("#kt_player").catch(() => {});
+  await page.mouse.click(200, 300).catch(() => {});
+
+  await sleep(Math.min(900, timeLeft()));
+
+  // Actively try to open quality/settings and click 1080p.
+  const clicked1080p = await page.evaluate(() => {
     const isVisible = (el) => {
-      if (!el) return false;
       const r = el.getBoundingClientRect();
       const s = window.getComputedStyle(el);
       return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
     };
 
     const clickEl = (el) => {
-      if (!el) return false;
-
       try {
         el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-        el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
         el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
         el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
         el.click();
@@ -1054,70 +1062,66 @@ const runFlow = async () => {
       }
     };
 
-    const playerCandidates = [
-      document.querySelector("#kt_player"),
-      document.querySelector(".kt-player"),
-      document.querySelector(".player"),
-      document.querySelector(".fp-player"),
-      document.querySelector(".video-holder"),
-      document.querySelector(".player-holder"),
-      document.querySelector("video"),
-    ].filter(Boolean);
+    const all = [...document.querySelectorAll("button, a, li, div, span")];
 
-    for (const el of playerCandidates) {
-      clickEl(el);
-    }
-
-    const video = document.querySelector("video");
-    if (video) {
-      video.muted = true;
-      video.play().catch(() => null);
-    }
-
-    const nodes = [...document.querySelectorAll("button, a, li, div, span")];
-
-    const direct1080 = nodes.find(el =>
+    // Direct 1080p button/menu item.
+    const direct1080 = all.find(el =>
       isVisible(el) &&
       /\b1080p\b/i.test((el.textContent || "").trim())
     );
 
     if (direct1080) {
-      clickEl(direct1080);
+      return clickEl(direct1080);
     }
 
-    return true;
+    // Open settings/quality/HD menu candidates.
+    const menuCandidates = all.filter(el => {
+      const txt = (el.textContent || "").trim();
+      const cls = `${el.className || ""} ${el.id || ""}`;
+      const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+
+      return isVisible(el) && (
+        /quality|settings|gear|resolution|hd/i.test(txt) ||
+        /quality|settings|gear|resolution|hd/i.test(cls) ||
+        /quality|settings|gear|resolution|hd/i.test(aria)
+      );
+    });
+
+    for (const el of menuCandidates.slice(0, 12)) {
+      clickEl(el);
+    }
+
+    const afterOpen1080 = [...document.querySelectorAll("button, a, li, div, span")]
+      .find(el =>
+        isVisible(el) &&
+        /\b1080p\b/i.test((el.textContent || "").trim())
+      );
+
+    if (afterOpen1080) {
+      return clickEl(afterOpen1080);
+    }
+
+    return false;
   }).catch(e => {
-    console.log(`[browser-1080p] player-start evaluate error: ${e.message}`);
+    console.log(`[browser-1080p] quality click error: ${e.message}`);
+    return false;
   });
 
-  await page.mouse.click(200, 300).catch(() => {});
-  await sleep(Math.min(1800, timeLeft()));
+  console.log(`[browser-1080p] clicked 1080p option: ${clicked1080p}`);
 
-  // Second playback nudge. Some KVS players only request the selected quality after resume.
+  // Nudge playback after selecting quality.
   await page.evaluate(() => {
     const video = document.querySelector("video");
     if (video) {
       video.muted = true;
-      video.play().catch(() => null);
+      return video.play().catch(() => null);
     }
-
-    const player =
-      document.querySelector("#kt_player") ||
-      document.querySelector(".kt-player") ||
-      document.querySelector(".player") ||
-      document.querySelector(".fp-player");
-
-    if (player) {
-      try {
-        player.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        player.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-        player.click();
-      } catch {}
-    }
+    return null;
   }).catch(() => {});
 
   await page.mouse.click(200, 300).catch(() => {});
-  await sleep(Math.min(3500, timeLeft()));
+
+  await sleep(Math.min(4500, timeLeft()));
 
   const perfUrls = await page.evaluate(() =>
     performance.getEntriesByType("resource").map(e => e.name).filter(Boolean)
