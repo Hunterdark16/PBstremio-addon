@@ -1287,13 +1287,11 @@ const considerUrl = (rawUrl, source) => {
       };
 
       const runFlow = async () => {
-        const targetUrl = pageUrl;
-
-        console.log(`[browser-1080p] opening lightweight full page ${targetUrl}`);
+        console.log(`[browser-1080p] opening lightweight full page ${pageUrl}`);
 
         if (!hasBudget("goto", 3000)) return;
 
-        await page.goto(targetUrl, {
+        await page.goto(pageUrl, {
           referer: BASE_URL + "/",
           waitUntil: "domcontentloaded",
           timeout: remaining(12000),
@@ -1316,100 +1314,27 @@ const considerUrl = (rawUrl, source) => {
 
         console.log(`[browser-1080p] localStorage selected_format=${selectedFormat || "(none)"}`);
 
-        await waitOrFound(700);
         if (isFound()) return;
+        if (!hasBudget("playback nudge", 1000)) return;
 
-        if (!hasBudget("player start", 1200)) return;
-
-        await page.click("#kt_player").catch(() => {});
-        await page.mouse.click(200, 300).catch(() => {});
-
-        await waitOrFound(1200);
-        if (isFound()) return;
-
-        if (!hasBudget("quality click", 1500)) return;
-
-        const clicked1080p = await page.evaluate(() => {
-          const isVisible = (el) => {
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-          };
-
-          const clickEl = (el) => {
-            try {
-              el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-              el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              el.click();
-              return true;
-            } catch {
-              return false;
-            }
-          };
-
-          const all = [...document.querySelectorAll("button, a, li, div, span")];
-
-          const direct1080 = all.find(el =>
-            isVisible(el) &&
-            /\b1080p\b/i.test((el.textContent || "").trim())
-          );
-
-          if (direct1080) {
-            return clickEl(direct1080);
-          }
-
-          const menuCandidates = all.filter(el => {
-            const txt = (el.textContent || "").trim();
-            const cls = `${el.className || ""} ${el.id || ""}`;
-            const aria = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
-
-            return isVisible(el) && (
-              /quality|settings|gear|resolution|hd/i.test(txt) ||
-              /quality|settings|gear|resolution|hd/i.test(cls) ||
-              /quality|settings|gear|resolution|hd/i.test(aria)
-            );
-          });
-
-          for (const el of menuCandidates.slice(0, 12)) {
-            clickEl(el);
-          }
-
-          const afterOpen1080 = [...document.querySelectorAll("button, a, li, div, span")]
-            .find(el =>
-              isVisible(el) &&
-              /\b1080p\b/i.test((el.textContent || "").trim())
-            );
-
-          if (afterOpen1080) {
-            return clickEl(afterOpen1080);
-          }
-
-          return false;
-        }).catch(e => {
-          console.log(`[browser-1080p] quality click error: ${e.message}`);
-          return false;
-        });
-
-        console.log(`[browser-1080p] clicked 1080p option: ${clicked1080p}`);
-
-        await waitOrFound(800);
-        if (isFound()) return;
-
-        if (!hasBudget("playback nudge", 1200)) return;
-
+        // Skip straight to the play nudge — the earlier click/quality-click steps
+        // never fire in time (player not ready at domcontentloaded) and only add
+        // ~2700ms of wasted sequential waits before reaching the actual trigger.
         await page.evaluate(() => {
-          const video = document.querySelector("video");
-          if (video) {
-            video.muted = true;
-            return video.play().catch(() => null);
-          }
-          return null;
+          try {
+            const video = document.querySelector("video");
+            if (video) {
+              video.muted = true;
+              video.play().catch(() => null);
+            }
+          } catch {}
         }).catch(() => {});
 
         await page.mouse.click(200, 300).catch(() => {});
 
-        await waitOrFound(6500);
+        // The KVS player fires the get_file XHR 16-20s after page load in all
+        // observed runs. waitOrFound exits immediately once the URL is captured.
+        await waitOrFound(20000);
         if (isFound()) return;
 
         if (!hasBudget("performance scan", 500)) return;
