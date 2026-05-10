@@ -24,6 +24,7 @@ const BROWSER_1080P_CACHE_MS = Number(process.env.BROWSER_1080P_CACHE_MS || 180 
 const BROWSER_IDLE_TTL_MS = Number(process.env.BROWSER_IDLE_TTL_MS || 30 * 1000);
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 const GETFILE_CAPTURE_GRACE_MS = Number(process.env.GETFILE_CAPTURE_GRACE_MS || 3500);
+const ENABLE_BROWSER_EMBED_FIRST = process.env.ENABLE_BROWSER_EMBED_FIRST === "1";
 
 // Cheap caches to avoid duplicate Stremio/UI requests.
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_MS || 45 * 1000);
@@ -209,6 +210,20 @@ async function fetchHtml(url, extraHeaders = {}) {
   const res = await doFetch(url, { headers: { ...HEADERS, ...extraHeaders } }, true);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return await res.text();
+}
+
+function cleanSlugPath(value) {
+  return String(value || "")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/null$/i, "");
+}
+
+function makeIdFromPath(pathname) {
+  return `pb:${cleanSlugPath(pathname)}`;
+}
+
+function decodeId(id) {
+  return cleanSlugPath(String(id || "").replace(/^pb:/, ""));
 }
 
 function makeIdFromPath(pathname) {
@@ -1456,14 +1471,15 @@ const considerUrl = (rawUrl, source) => {
     }
   };
 
-  // First try the lighter embed player.
+  if (ENABLE_BROWSER_EMBED_FIRST) {
   await runPlayerAttempt(`${BASE_URL}/embed/${videoId}`, pageUrl, "embed player");
+} else {
+  console.log("[browser-1080p] browser embed attempt skipped; going straight to full page");
+}
 
-  // If embed did not expose 1080p, fall back to your original full-page flow.
-  if (!isFound()) {
-    console.log("[browser-1080p] embed did not produce 1080p; falling back to full page");
-    await runPlayerAttempt(pageUrl, BASE_URL + "/", "full page");
-  }
+if (!isFound()) {
+  await runPlayerAttempt(pageUrl, BASE_URL + "/", "full page");
+}
 };
 
       // Do not race runFlow against sleep(timeout).
